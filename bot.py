@@ -892,6 +892,40 @@ def ks_upd(pnl):
 #  REAL API BINANCE EXECUTION ENGINE (GUARDED LIVE OPEN & CLOSE)
 # ═══════════════════════════════════════════════════════════════════════════
 
+def _fetch_order_fills(sym, order_id, tries=5, delay=0.6):
+    """
+    FIX PNL SYNC: ambil data fill ASLI dari Binance (userTrades) untuk 1 order:
+    harga rata-rata fill, qty, realizedPnl, dan commission (fee) yang sama persis dengan yang tampil di exchange.
+    Return dict, atau None kalau data fill belum tersedia setelah beberapa kali coba.
+    """
+    if not order_id:
+        return None
+    try:
+        oid = int(order_id)
+    except Exception:
+        return None
+
+    for _ in range(tries):
+        try:
+            trs = _rest_call(f"fills_{sym}", client.futures_account_trades, symbol=sym, orderId=oid)
+            if trs:
+                tot_qty = tot_quote = realized = fee = 0.0
+                for t in trs:
+                    q = float(t.get("qty", 0.0))
+                    p = float(t.get("price", 0.0))
+                    tot_qty += q
+                    tot_quote += p * q
+                    realized += float(t.get("realizedPnl", 0.0))
+                    c = float(t.get("commission", 0.0))
+                    # fee dalam USDT; kalau dibayar pakai aset lain (mis. BNB) pakai estimasi 0.04%
+                    fee += c if t.get("commissionAsset", "USDT") in ("USDT", "USDC", "BUSD") else p * q * 0.0004
+                if tot_qty > 0:
+                    return {"avg_price": tot_quote / tot_qty, "qty": tot_qty, "realized_pnl": realized, "fee": fee}
+        except Exception as e:
+            _log_err(f"fills_{sym}", e)
+        time.sleep(delay)
+    return None
+
 def live_open(orig_direction, score, sigs, price, atr, regime, bias, sym, risk_profile):
     global is_logic_inverted, _inverted_forced_side
 
@@ -952,6 +986,14 @@ def live_open(orig_direction, score, sigs, price, atr, regime, bias, sym, risk_p
         with _lock: live_positions.pop(sym, None)
         return
 
+    # FIX PNL SYNC: avgPrice dari respons MARKET order sering 0 -> sebelumnya entry memakai harga mark/ticker (bukan harga fill).
+    # Sekarang entry price & fee diambil dari fill asli exchange.
+    entry_fill = _fetch_order_fills(sym, order_res.get("orderId"))
+    if entry_fill:
+        price = entry_fill["avg_price"]
+    else:
+        print(f"  ⚠️ [FILL SYNC] Fill ENTRY {sym} belum terbaca dari exchange — entry pakai estimasi harga.")
+
     risk = DynamicRiskManager.calculate_levels(price, execution_side, atr)
     open_ts = time.time()
     acc_label = "TESTNET DEMO" if USE_DEMO_ACCOUNT else "REAL MAINNET"
@@ -975,6 +1017,7 @@ def live_open(orig_direction, score, sigs, price, atr, regime, bias, sym, risk_p
         "peak_price": price,
         "mode": entry_mode,
         "order_id": order_res.get("orderId"),
+        "entry_fee": entry_fill["fee"] if entry_fill else None,
     }
 
     with _lock:
@@ -1029,41 +1072,38 @@ def live_close(sym, reason, price=None):
     entry = pos["entry"]
     entry_mode = pos.get("mode", "NORMAL")
 
+    # FIX PNL SYNC: PnL diambil dari fill ASLI exchange (harga fill, realizedPnl, fee) — sama dengan yang tampil di Binance.
+    # gross_pnl = "PNL Terealisasi" di riwayat perdagangan Binance, pnl (net) = gross - fee entry - fee exit.
     pnl_synced = False
-    try:
-        time.sleep(0.3)
-        trades = _rest_call(
-            f"user_trades_{sym}",
-            client.futures_account_trades,
-            symbol=sym,
-            limit=10
-        )
-        if trades:
-            close_order_id = int(close_res.get("orderId", -1))
-            matching_trades = [t for t in trades if int(t.get("orderId", 0)) == close_order_id]
-            
-            if matching_trades:
-                realized_pnl_sum = sum(float(t.get("realizedPnl", 0.0)) for t in matching_trades)
-                fee_sum = sum(float(t.get("commission", 0.0)) for t in matching_trades)
-                
-                open_order_id = int(pos.get("order_id", -1))
-                open_trades = [t for t in trades if int(t.get("orderId", 0)) == open_order_id]
-                entry_fee_sum = sum(float(t.get("commission", 0.0)) for t in open_trades) if open_trades else (entry * q_val * 0.0004)
+    gross_pnl = 0.0
+    fee_entry = 0.0
+    fee_exit = 0.0
+    close_fill = _fetch_order_fills(sym, close_res.get("orderId"))
 
-                pnl = realized_pnl_sum - fee_sum - entry_fee_sum
-                pnl_synced = True
-    except Exception as e:
-        _log_err(f"sync_pnl_{sym}", e)
-
-    if not pnl_synced:
+    if close_fill:
+        price = close_fill["avg_price"]
+        gross_pnl = close_fill["realized_pnl"]
+        fee_exit = close_fill["fee"]
+        fee_entry = pos.get("entry_fee")
+        if fee_entry is None:
+            open_fill = _fetch_order_fills(sym, pos.get("order_id"), tries=2)
+            fee_entry = open_fill["fee"] if open_fill else (entry * q_val * 0.0004)
+        pnl = gross_pnl - fee_entry - fee_exit
+        pnl_synced = True
+    else:
+        print(f"  ⚠️ [FILL SYNC] Fill CLOSE {sym} belum terbaca dari exchange — PnL ini ESTIMASI (ditandai EST).")
         if side == "LONG":
             gross_pnl = (price - entry) * q_val
         else:
             gross_pnl = (entry - price) * q_val
 
-        fee_entry = (entry * q_val) * 0.0004
+        fee_entry = pos.get("entry_fee")
+        if fee_entry is None:
+            fee_entry = (entry * q_val) * 0.0004
         fee_exit = (price * q_val) * 0.0004
         pnl = gross_pnl - (fee_entry + fee_exit)
+
+    sync_tag = "" if pnl_synced else " (EST)"
 
     pct = ((price - entry) / entry * 100) if side == "LONG" else ((entry - price) / entry * 100)
     close_ts = time.time()
@@ -1102,7 +1142,7 @@ def live_close(sym, reason, price=None):
 
     print(
         f"  {e_icon} [API EXIT CLOSED] {sym} {side} CLOSE [{entry_mode}] — {reason} | "
-        f"{entry:.6g}→{price:.6g} ({pct:+.3f}%) hold:{hold:.0f}s | PnL:{pnl:+.5f}U | Out:{close_wita} WITA"
+        f"{entry:.6g}→{price:.6g} ({pct:+.3f}%) hold:{hold:.0f}s | PnL Net:{pnl:+.5f}U (Gross:{gross_pnl:+.5f} Fee:{fee_entry + fee_exit:.5f}){sync_tag} | Out:{close_wita} WITA"
     )
 
     trade = TradeRecord(
@@ -1137,6 +1177,8 @@ def live_close(sym, reason, price=None):
     trade_log.append({
         "sym": sym, "side": side, "entry": round(entry, 7),
         "exit": round(price, 7), "pnl": round(pnl, 5),
+        "gross": round(gross_pnl, 5), "fee": round(fee_entry + fee_exit, 5),
+        "est": (not pnl_synced),
         "reason": reason, "hold": int(hold),
         "in_wita": open_wita,
         "out_wita": close_wita,
@@ -1301,7 +1343,7 @@ def print_full():
             in_t = t.get("in_wita", "--:--:--")
             out_t = t.get("out_wita", "--:--:--")
             mode_lbl = f"[{t.get('mode', 'NORMAL')}]"
-            print(f"        {em} {t['sym']:<12} {t['side']:<5} {mode_lbl:<10} {t['pnl']:+.5f}U {t['hold']}s — {t['reason']:<11} | In:{in_t} Out:{out_t}")
+            print(f"        {em} {t['sym']:<12} {t['side']:<5} {mode_lbl:<10} {t['pnl']:+.5f}U (G:{t.get('gross', 0.0):+.4f}{'*' if t.get('est') else ''}) {t['hold']}s — {t['reason']:<11} | In:{in_t} Out:{out_t}")
     print(f"  {'─'*72}")
 
 def t_monitor():
