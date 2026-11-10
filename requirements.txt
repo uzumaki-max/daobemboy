@@ -1,0 +1,10 @@
+flask
+gunicorn
+python-dotenv
+python-binance==1.0.19
+ta
+pandas
+requests
+numpy
+scikit-learn
+websocket-client
