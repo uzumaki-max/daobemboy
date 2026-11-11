@@ -11,6 +11,10 @@ PERBAIKAN TAMBAHAN (hotfix):
   dan baru dilepas SETELAH mode NORMAL/INVERTED di-flip + cooldown koin terpasang.
   (Sebelumnya scanner bisa entry di tengah proses close dengan mode lama -> LONG setelah LONG loss.)
 - FIX LABEL MODE: entry_mode & execution_side ditentukan bersamaan di awal live_open.
+- BEST PICK SCANNER (v23.4): scan SELURUH koin tiap siklus, pilih kandidat dengan skor TERTINGGI untuk arah yang dituju
+  (INVERTED: koin terbaik untuk arah yang dikunci; NORMAL: koin terbaik LONG/SHORT). Tidak lagi terpaku pada koin yang itu-itu saja.
+- FIX SIGNAL LAG (v23.5): semua indikator/sinyal sekarang membaca candle CLOSED TERBARU (iloc[-1]); sebelumnya iloc[-2]
+  sehingga sinyal tertinggal 5-10 menit. Cache candle hanya berisi candle closed. INVERTED_MIN_SCORE diturunkan ke 50.
 - FIX DEADLOCK INVERTED: di mode INVERTED arah eksekusi sudah dikunci, jadi bot TIDAK lagi
   mewajibkan sinyal analisa berlawanan (yang bentrok dengan penalti BTC trend dan membuat bot tidak pernah entry).
 """
@@ -122,6 +126,11 @@ MIN_SL_PCT        = 0.015
 MAX_SL_PCT        = 0.025
 MAX_HOLD_SECONDS  = 6120   # 1 jam 42 menit
 COIN_COOLDOWN_SEC = 900    # 15 menit cooldown setelah exit per koin
+
+# Best-Pick Scanner
+INVERTED_MIN_SCORE     = 50         # skor minimal arah terkunci di mode INVERTED (sebelumnya sama dgn MIN_SCORE=58)
+SAME_COIN_RANK_PENALTY = 15         # koin yang baru saja ditradingkan diberi penalti ranking (set 0 untuk mematikan)
+FULL_SCAN_INTERVAL     = 0.3        # jeda antar scan seluruh koin (detik)
 
 # Institutional Order Book
 WALL_RATIO_THRESHOLD  = 2.5
@@ -332,7 +341,7 @@ class AbsorptionDetector:
     @staticmethod
     def detect(df: pd.DataFrame) -> Tuple[bool, bool, str]:
         if df is None or len(df) < 25: return False, False, ""
-        row = df.iloc[-2]
+        row = df.iloc[-1]
         
         vol_spike = row.get("vr", 1.0) >= 1.4
         rng = row.get("rng", 1.0)
@@ -399,7 +408,7 @@ class MarketRegime:
     @staticmethod
     def detect(df: pd.DataFrame) -> Tuple[str, float, float]:
         if df is None or len(df) < 55: return MarketRegime.REGIME_RANGE, 0, 0
-        row, prev = df.iloc[-2], df.iloc[-3]
+        row, prev = df.iloc[-1], df.iloc[-2]
         close = row["close"]
         e5, e9, e21, e50 = row["e5"], row["e9"], row["e21"], row["e50"]
         atr, atr_prev = row["atr"], prev["atr"]
@@ -473,7 +482,7 @@ class SignalScorer:
         regime, strength, bias = MarketRegime.detect(df)
         long_score, long_sigs = self._score_long(df, symbol)
         short_score, short_sigs = self._score_short(df, symbol)
-        atr = df["atr"].iloc[-2]
+        atr = df["atr"].iloc[-1]
 
         btc_reg = _btc_macro.get("regime", "UNKNOWN")
         if btc_reg == MarketRegime.REGIME_TRENDING_BULL:
@@ -490,8 +499,41 @@ class SignalScorer:
 
         return None, max(long_score, short_score), [], atr, regime, bias
 
+    def get_side_signal(self, df: pd.DataFrame, symbol: str, side: str) -> Tuple[Optional[str], int, List[str], float, str, float]:
+        """
+        Dipakai mode INVERTED: arah sudah dikunci (LONG/SHORT), jadi hitung skor KHUSUS arah itu
+        untuk mencari koin yang paling berpotensi bergerak ke arah tersebut.
+        Penyesuaian BTC trend sama seperti get_signal.
+        """
+        if df is None or len(df) < 55 or side not in ("LONG", "SHORT"):
+            return None, 0, [], 0.0, "UNKNOWN", 0.0
+
+        regime, strength, bias = MarketRegime.detect(df)
+        atr = df["atr"].iloc[-1]
+
+        if side == "LONG":
+            score, sigs = self._score_long(df, symbol)
+        else:
+            score, sigs = self._score_short(df, symbol)
+
+        btc_reg = _btc_macro.get("regime", "UNKNOWN")
+        if btc_reg == MarketRegime.REGIME_TRENDING_BULL:
+            if side == "LONG":
+                score += 10; sigs.append("BTC_BullTrend[+10]")
+            else:
+                score -= 20
+        elif btc_reg == MarketRegime.REGIME_TRENDING_BEAR:
+            if side == "SHORT":
+                score += 10; sigs.append("BTC_BearTrend[+10]")
+            else:
+                score -= 20
+
+        if score >= INVERTED_MIN_SCORE:
+            return side, score, sigs, atr, regime, bias
+        return None, score, [], atr, regime, bias
+
     def _score_long(self, df: pd.DataFrame, symbol: str) -> Tuple[int, List[str]]:
-        row, prev, prev2 = df.iloc[-2], df.iloc[-3], df.iloc[-4]
+        row, prev, prev2 = df.iloc[-1], df.iloc[-2], df.iloc[-3]
         score, signals = 0, []
         p, e5, e9, e21, e50 = row["close"], row["e5"], row["e9"], row["e21"], row["e50"]
 
@@ -525,7 +567,7 @@ class SignalScorer:
         return score, signals
 
     def _score_short(self, df: pd.DataFrame, symbol: str) -> Tuple[int, List[str]]:
-        row, prev, prev2 = df.iloc[-2], df.iloc[-3], df.iloc[-4]
+        row, prev, prev2 = df.iloc[-1], df.iloc[-2], df.iloc[-3]
         score, signals = 0, []
         p, e5, e9, e21, e50 = row["close"], row["e5"], row["e9"], row["e21"], row["e50"]
 
@@ -619,6 +661,7 @@ _executor        = ThreadPoolExecutor(max_workers=MAX_WORKERS)
 _rescan_q        = queue.Queue()
 _hot_syms        = deque(maxlen=30)
 _coin_cooldown   = {}  # Track timestamp exit per symbol
+_last_traded_sym = None  # koin terakhir yang ditradingkan (untuk penalti ranking)
 
 _ws_mark_price   = {}
 _kline_cache     = {}
@@ -836,6 +879,10 @@ def _bootstrap_klines(symbol, interval, limit=100):
         kl = _rest_call(f"bootstrap_klines_{symbol}", client.futures_klines, symbol=symbol, interval=interval, limit=limit)
         df = pd.DataFrame(kl, columns=["time","open","high","low","close","volume","ct","qv","trades","tbbase","tbquote","ignore"])
         for c in ["open","high","low","close","volume","tbbase","tbquote"]: df[c] = df[c].astype(float)
+        # FIX SIGNAL LAG: buang candle yang masih berjalan. Cache HANYA berisi candle closed (konsisten dengan append dari WebSocket),
+        # sehingga iloc[-1] selalu candle closed terbaru.
+        now_ms = int(time.time() * 1000)
+        df = df[df["ct"].astype("int64") < now_ms].reset_index(drop=True)
         df = _compute_indicators(df)
         with _kline_lock: _kline_cache[symbol] = df
         return df
@@ -1033,7 +1080,7 @@ def live_open(orig_direction, score, sigs, price, atr, regime, bias, sym, risk_p
     if any("Absorb" in s for s in sigs): _stats["absorb_entries"] += 1
 
 def live_close(sym, reason, price=None):
-    global is_logic_inverted, _last_failed_execution_side, _inverted_forced_side, _weekly_pnl
+    global is_logic_inverted, _last_failed_execution_side, _inverted_forced_side, _weekly_pnl, _last_traded_sym
 
     # FIX RACE CONDITION: posisi TIDAK di-pop di awal. Slot tetap terisi (len(live_positions) tetap penuh)
     # selama proses close, sehingga scanner tidak bisa entry dengan mode lama.
@@ -1115,6 +1162,7 @@ def live_close(sym, reason, price=None):
     open_wita = pos.get("open_time_wita", datetime.fromtimestamp(pos["open_time"], tz=WITA_TZ).strftime("%H:%M:%S"))
 
     _coin_cooldown[sym] = close_ts + COIN_COOLDOWN_SEC
+    _last_traded_sym = sym
 
     # FIX LOGIC BUG ON INVERTED DIRECTION SWITCH
     if not won:
@@ -1233,7 +1281,7 @@ def scan_one(sym):
         if df is None: return None
         df_ta = run_ta(df.copy())
         
-        last_row = df_ta.iloc[-2]
+        last_row = df_ta.iloc[-1]
         px_candle = last_row["close"]
         atr_val   = last_row["atr"]
         vr_val    = last_row.get("vr", 0.0)
@@ -1246,16 +1294,18 @@ def scan_one(sym):
             _stats["low_vol_veto"] += 1
             return None
 
-        orig_direction, score, sigs, _, regime, bias = scorer.get_signal(df_ta, sym)
-        if orig_direction is None or orig_direction not in ("LONG", "SHORT"):
-            return None
-
-        # FIX DEADLOCK INVERTED: saat INVERTED arah eksekusi sudah dikunci (_inverted_forced_side),
-        # jadi sinyal analisa apa pun (LONG/SHORT) yang lolos filter & skor boleh dipakai.
-        # Sebelumnya wajib sinyal berlawanan, yang bentrok dengan penalti BTC trend (-20) sehingga bot tidak pernah entry.
-        if is_logic_inverted and _inverted_forced_side:
-            execution_side = _inverted_forced_side
+        # BEST PICK: mode INVERTED -> hitung skor khusus arah yang dikunci (cari koin terbaik utk arah itu).
+        # Mode NORMAL -> arah bebas, ambil sinyal terkuat (LONG/SHORT) dari analisa.
+        inv_now, forced_now = is_logic_inverted, _inverted_forced_side
+        if inv_now and forced_now:
+            execution_side = forced_now
+            orig_direction, score, sigs, _, regime, bias = scorer.get_side_signal(df_ta, sym, execution_side)
+            if orig_direction is None:
+                return None
         else:
+            orig_direction, score, sigs, _, regime, bias = scorer.get_signal(df_ta, sym)
+            if orig_direction is None or orig_direction not in ("LONG", "SHORT"):
+                return None
             execution_side = orig_direction
 
         # ── FILTER 2: DIRECTIONAL SAME-SIDE LOSS GUARD ─────────────────────
@@ -1353,9 +1403,38 @@ def t_monitor():
         except: pass
         time.sleep(MONITOR_INT)
 
+def scan_all(syms):
+    """Scan SELURUH koin sekaligus (paralel) dan kembalikan semua kandidat yang lolos semua filter."""
+    res = []
+    fut = {_executor.submit(scan_one, s): s for s in syms}
+    try:
+        for f in as_completed(fut, timeout=5):
+            try:
+                r = f.result(timeout=1)
+                if r: res.append(r)
+            except Exception:
+                pass
+    except Exception:
+        pass
+    return res
+
+def rank_candidates(res):
+    """Urutkan kandidat: skor tertinggi dulu. Koin yang baru saja ditradingkan kena penalti supaya tidak itu-itu saja."""
+    def key(r):
+        pen = SAME_COIN_RANK_PENALTY if r[0] == _last_traded_sym else 0
+        return r[2] - pen
+    return sorted(res, key=key, reverse=True)
+
+def open_best(res, slots):
+    ranked = rank_candidates(res)
+    for r in ranked[:slots]:
+        if len(live_positions) >= MAX_POSITIONS: break
+        sym, od, sc, sg, px, atr, regime, bias, risk_profile = r
+        others = ", ".join(f"{x[0]}:{x[2]:.0f}" for x in ranked[1:4]) or "-"
+        print(f"\n  🎯 [BEST PICK] {sym} {od} score:{sc:.0f} (dari {len(ranked)} kandidat lolos) | Runner-up: {others}")
+        live_open(od, sc, sg, px, atr, regime, bias, sym, risk_profile)
+
 def t_slot_filler(syms):
-    scan_idx = 0
-    n_bat = max(1, math.ceil(len(syms) / BATCH_SIZE))
     while True:
         try:
             slots = MAX_POSITIONS - len(live_positions)
@@ -1366,26 +1445,15 @@ def t_slot_filler(syms):
             with _lock:
                 valid_syms = [s for s in syms if s not in live_positions and now >= _coin_cooldown.get(s, 0)]
 
-            hot = [s for s in _hot_syms if s in valid_syms]
-            mv = top_movers(valid_syms, 30)
-            bs = scan_idx * BATCH_SIZE
-            reg = [s for s in valid_syms[bs:bs+BATCH_SIZE] if s not in mv]
-            scan_idx = (scan_idx + 1) % n_bat
-            scan_list = list(dict.fromkeys(hot[:5] + mv[:20] + reg[:15]))[:BATCH_SIZE]
+            if not valid_syms:
+                time.sleep(FULL_SCAN_INTERVAL); continue
 
-            if not scan_list:
-                time.sleep(SLOT_FILL_INT); continue
-
-            res = scan_batch(scan_list)
+            res = scan_all(valid_syms)
             if res:
-                res.sort(key=lambda x: x[2], reverse=True)
-                for r in res[:slots]:
-                    if len(live_positions) >= MAX_POSITIONS: break
-                    sym, od, sc, sg, px, atr, regime, bias, risk_profile = r
-                    live_open(od, sc, sg, px, atr, regime, bias, sym, risk_profile)
+                open_best(res, slots)
         except Exception as e:
             _log_err("t_slot_filler", e)
-        time.sleep(SLOT_FILL_INT)
+        time.sleep(FULL_SCAN_INTERVAL)
 
 def t_rescan(syms):
     while True:
@@ -1397,15 +1465,9 @@ def t_rescan(syms):
 
             now = time.time()
             valid_syms = [s for s in syms if s not in live_positions and now >= _coin_cooldown.get(s, 0)]
-            hot = [s for s in _hot_syms if s in valid_syms]
-            rest = [s for s in valid_syms if s not in hot]
-            res = scan_batch((hot + rest)[:30])
+            res = scan_all(valid_syms)
             if res:
-                res.sort(key=lambda x: x[2], reverse=True)
-                for r in res[:slots]:
-                    if len(live_positions) >= MAX_POSITIONS: break
-                    sym, od, sc, sg, px, atr, regime, bias, risk_profile = r
-                    live_open(od, sc, sg, px, atr, regime, bias, sym, risk_profile)
+                open_best(res, slots)
         except: pass
 
 def t_macro():
@@ -1517,7 +1579,7 @@ def run_bot():
         time.sleep(0.15)
 
     print("  ⏳ Memulai Instant Warm-Up: Sinkronisasi data awal WebSocket...")
-    for s in syms[:BATCH_SIZE]:
+    for s in syms:   # semua koin di-bootstrap supaya seluruh universe bisa discan sejak awal
         _bootstrap_klines(s, Client.KLINE_INTERVAL_5MINUTE, 100)
     time.sleep(2.0)
 
