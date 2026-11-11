@@ -13,6 +13,9 @@ PERBAIKAN TAMBAHAN (hotfix):
 - FIX LABEL MODE: entry_mode & execution_side ditentukan bersamaan di awal live_open.
 - BEST PICK SCANNER (v23.4): scan SELURUH koin tiap siklus, pilih kandidat dengan skor TERTINGGI untuk arah yang dituju
   (INVERTED: koin terbaik untuk arah yang dikunci; NORMAL: koin terbaik LONG/SHORT). Tidak lagi terpaku pada koin yang itu-itu saja.
+- NO-PAUSE ENGINE (v23.6): saat posisi masih HOLD, bot terus scan untuk 2 skenario sekaligus (jika WIN / jika LOSS) dan menyimpan
+  kandidat terbaik masing-masing. Begitu posisi close, kandidat yang sudah siap divalidasi ulang & langsung dieksekusi.
+  Ditambah SCAN REPORT (alasan kenapa tidak entry) dan IDLE RELAX (skor minimal turun bertahap kalau terlalu lama menganggur).
 - FIX SIGNAL LAG (v23.5): semua indikator/sinyal sekarang membaca candle CLOSED TERBARU (iloc[-1]); sebelumnya iloc[-2]
   sehingga sinyal tertinggal 5-10 menit. Cache candle hanya berisi candle closed. INVERTED_MIN_SCORE diturunkan ke 50.
 - FIX DEADLOCK INVERTED: di mode INVERTED arah eksekusi sudah dikunci, jadi bot TIDAK lagi
@@ -104,7 +107,7 @@ MIN_ATR_PCT      = 0.003
 SCAN_INTERVAL = 2.0
 MONITOR_INT   = 0.1
 BATCH_SIZE    = 15
-MAX_WORKERS   = 5
+MAX_WORKERS   = 8
 SLOT_FILL_INT = 0.01
 
 # REST API Safety
@@ -131,6 +134,19 @@ COIN_COOLDOWN_SEC = 900    # 15 menit cooldown setelah exit per koin
 INVERTED_MIN_SCORE     = 50         # skor minimal arah terkunci di mode INVERTED (sebelumnya sama dgn MIN_SCORE=58)
 SAME_COIN_RANK_PENALTY = 15         # koin yang baru saja ditradingkan diberi penalti ranking (set 0 untuk mematikan)
 FULL_SCAN_INTERVAL     = 0.3        # jeda antar scan seluruh koin (detik)
+
+# No-Pause Engine
+PREP_SCAN_INTERVAL   = 1.0    # saat HOLD: seberapa sering menyiapkan kandidat WIN/LOSS (detik)
+PREP_TOP_N           = 5      # jumlah kandidat teratas yang disiapkan per skenario
+PREP_MAX_AGE         = 10.0   # kandidat siap dianggap basi setelah N detik (fallback ke scan penuh)
+SCAN_REPORT_EVERY    = 10     # tampilkan SCAN REPORT tiap N siklus (siklus = 2 detik)
+
+# Idle Relax: kalau slot kosong terlalu lama, skor minimal turun bertahap (Filter 1 tidak disentuh)
+IDLE_RELAX_ENABLED   = True
+IDLE_RELAX_AFTER_SEC = 600    # mulai relax setelah 10 menit tanpa posisi
+IDLE_RELAX_STEP_SEC  = 300    # tiap 5 menit berikutnya turun lagi
+IDLE_RELAX_PER_STEP  = 4      # poin skor yang diturunkan per langkah
+IDLE_RELAX_MAX       = 12     # maksimal penurunan skor
 
 # Institutional Order Book
 WALL_RATIO_THRESHOLD  = 2.5
@@ -492,9 +508,10 @@ class SignalScorer:
             short_score += 10; short_sigs.append("BTC_BearTrend[+10]")
             long_score -= 20
 
-        if long_score >= MIN_SCORE and long_score >= short_score:
+        min_sc = MIN_SCORE - score_relax()
+        if long_score >= min_sc and long_score >= short_score:
             return "LONG", long_score, long_sigs, atr, regime, bias
-        elif short_score >= MIN_SCORE and short_score > long_score:
+        elif short_score >= min_sc and short_score > long_score:
             return "SHORT", short_score, short_sigs, atr, regime, bias
 
         return None, max(long_score, short_score), [], atr, regime, bias
@@ -528,7 +545,7 @@ class SignalScorer:
             else:
                 score -= 20
 
-        if score >= INVERTED_MIN_SCORE:
+        if score >= INVERTED_MIN_SCORE - score_relax():
             return side, score, sigs, atr, regime, bias
         return None, score, [], atr, regime, bias
 
@@ -662,6 +679,9 @@ _rescan_q        = queue.Queue()
 _hot_syms        = deque(maxlen=30)
 _coin_cooldown   = {}  # Track timestamp exit per symbol
 _last_traded_sym = None  # koin terakhir yang ditradingkan (untuk penalti ranking)
+_flat_since      = time.time()  # kapan slot terakhir kosong (untuk Idle Relax)
+_prepared        = {"WIN": [], "LOSS": [], "ts": 0.0, "sym": None}  # kandidat siap saat HOLD
+_last_reject     = {}   # diagnostik: alasan terakhir tiap koin tidak lolos
 
 _ws_mark_price   = {}
 _kline_cache     = {}
@@ -939,6 +959,31 @@ def ks_upd(pnl):
 #  REAL API BINANCE EXECUTION ENGINE (GUARDED LIVE OPEN & CLOSE)
 # ═══════════════════════════════════════════════════════════════════════════
 
+def score_relax() -> int:
+    """Penurunan skor minimal bertahap kalau slot kosong terlalu lama. Selalu 0 saat ada posisi (termasuk saat menyiapkan kandidat)."""
+    if not IDLE_RELAX_ENABLED or live_positions:
+        return 0
+    idle = time.time() - _flat_since
+    if idle < IDLE_RELAX_AFTER_SEC:
+        return 0
+    steps = 1 + int((idle - IDLE_RELAX_AFTER_SEC) // IDLE_RELAX_STEP_SEC)
+    return min(IDLE_RELAX_MAX, steps * IDLE_RELAX_PER_STEP)
+
+def predict_state(outcome: str, held_side: str):
+    """
+    Prediksi state mode SETELAH posisi close, persis seperti logika di live_close.
+    Return (is_inverted, forced_side, last_failed_side).
+    """
+    inv, forced = is_logic_inverted, _inverted_forced_side
+    if outcome == "WIN":
+        return (inv, forced, None)
+    if not inv:   # NORMAL loss -> INVERTED, arah dikunci berlawanan dari posisi yang loss
+        return (True, "LONG" if held_side == "SHORT" else "SHORT", held_side)
+    return (False, None, held_side)   # INVERTED loss -> kembali NORMAL
+
+def _reject(sym, reason, score=None, side="-", req=None):
+    _last_reject[sym] = (reason, score, side, req, time.time())
+
 def _fetch_order_fills(sym, order_id, tries=5, delay=0.6):
     """
     FIX PNL SYNC: ambil data fill ASLI dari Binance (userTrades) untuk 1 order:
@@ -1080,7 +1125,7 @@ def live_open(orig_direction, score, sigs, price, atr, regime, bias, sym, risk_p
     if any("Absorb" in s for s in sigs): _stats["absorb_entries"] += 1
 
 def live_close(sym, reason, price=None):
-    global is_logic_inverted, _last_failed_execution_side, _inverted_forced_side, _weekly_pnl, _last_traded_sym
+    global is_logic_inverted, _last_failed_execution_side, _inverted_forced_side, _weekly_pnl, _last_traded_sym, _flat_since
 
     # FIX RACE CONDITION: posisi TIDAK di-pop di awal. Slot tetap terisi (len(live_positions) tetap penuh)
     # selama proses close, sehingga scanner tidak bisa entry dengan mode lama.
@@ -1187,6 +1232,7 @@ def live_close(sym, reason, price=None):
     # jadi entry berikutnya pasti memakai mode/arah yang benar.
     with _lock:
         live_positions.pop(sym, None)
+        _flat_since = time.time()
 
     print(
         f"  {e_icon} [API EXIT CLOSED] {sym} {side} CLOSE [{entry_mode}] — {reason} | "
@@ -1234,7 +1280,7 @@ def live_close(sym, reason, price=None):
     })
 
     _hot_syms.appendleft(sym)
-    _rescan_q.put(1)
+    _rescan_q.put("WIN" if won else "LOSS")   # kirim hasil supaya kandidat yang sudah disiapkan saat HOLD bisa langsung dipakai
     print_inline()
 
 def monitor_positions():
@@ -1271,14 +1317,27 @@ def monitor_positions():
 #  SCANNER THREAD & STRICT FILTERS
 # ═══════════════════════════════════════════════════════════════════════════
 
-def scan_one(sym):
+def scan_one(sym, state=None):
+    """
+    Evaluasi 1 koin. state = (is_inverted, forced_side, last_failed_side).
+    state=None -> pakai state LIVE saat ini (dan hasilnya dicatat ke diagnostik).
+    state diisi -> dipakai untuk menyiapkan kandidat skenario WIN/LOSS saat posisi masih HOLD.
+    """
+    rec = state is None
+    if state is None:
+        state = (is_logic_inverted, _inverted_forced_side, _last_failed_execution_side)
+    inv_now, forced_now, failed_side = state
+
     try:
         if time.time() < _coin_cooldown.get(sym, 0):
+            if rec: _reject(sym, "COOLDOWN")
             return None
 
         time.sleep(0.002)
         df = ohlcv(sym, Client.KLINE_INTERVAL_5MINUTE, 100)
-        if df is None: return None
+        if df is None:
+            if rec: _reject(sym, "NO_DATA")
+            return None
         df_ta = run_ta(df.copy())
         
         last_row = df_ta.iloc[-1]
@@ -1287,57 +1346,77 @@ def scan_one(sym):
         vr_val    = last_row.get("vr", 0.0)
         adx_val   = last_row.get("adx", 0.0)
 
-        if px_candle == 0 or np.isnan(atr_val): return None
+        if px_candle == 0 or np.isnan(atr_val):
+            if rec: _reject(sym, "NO_DATA")
+            return None
 
         # ── FILTER 1: Volume & Sideway Guard ─────────────────────────
-        if vr_val < MIN_VOLUME_RATIO or adx_val < MIN_ADX_TREND or (atr_val / px_candle) < MIN_ATR_PCT:
-            _stats["low_vol_veto"] += 1
+        f1 = []
+        if vr_val < MIN_VOLUME_RATIO: f1.append("vol")
+        if adx_val < MIN_ADX_TREND: f1.append("adx")
+        if (atr_val / px_candle) < MIN_ATR_PCT: f1.append("atr")
+        if f1:
+            if rec:
+                _stats["low_vol_veto"] += 1
+                _reject(sym, "F1:" + "+".join(f1))
             return None
 
         # BEST PICK: mode INVERTED -> hitung skor khusus arah yang dikunci (cari koin terbaik utk arah itu).
         # Mode NORMAL -> arah bebas, ambil sinyal terkuat (LONG/SHORT) dari analisa.
-        inv_now, forced_now = is_logic_inverted, _inverted_forced_side
         if inv_now and forced_now:
             execution_side = forced_now
             orig_direction, score, sigs, _, regime, bias = scorer.get_side_signal(df_ta, sym, execution_side)
             if orig_direction is None:
+                if rec: _reject(sym, "LOW_SCORE", score, execution_side, INVERTED_MIN_SCORE - score_relax())
                 return None
         else:
             orig_direction, score, sigs, _, regime, bias = scorer.get_signal(df_ta, sym)
             if orig_direction is None or orig_direction not in ("LONG", "SHORT"):
+                if rec: _reject(sym, "LOW_SCORE", score, "-", MIN_SCORE - score_relax())
                 return None
             execution_side = orig_direction
 
         # ── FILTER 2: DIRECTIONAL SAME-SIDE LOSS GUARD ─────────────────────
-        if _last_failed_execution_side is not None and execution_side == _last_failed_execution_side:
+        if failed_side is not None and execution_side == failed_side:
             required_score = MIN_SCORE + SAME_SIDE_EXTRA_SCORE
             m5_val = last_row.get("m5", 0.0)
             trend_aligned = (execution_side == "LONG" and m5_val > 0.001) or (execution_side == "SHORT" and m5_val < -0.001)
 
             if score < required_score or adx_val < 25.0 or not trend_aligned:
-                _stats["same_side_veto"] += 1
+                if rec:
+                    _stats["same_side_veto"] += 1
+                    _reject(sym, "SAME_SIDE", score, execution_side, required_score)
                 return None
 
         px_live = price_live(sym)
-        if px_live == 0: return None
+        if px_live == 0:
+            if rec: _reject(sym, "NO_PRICE")
+            return None
 
         btc_vetoed, _ = btc_macro.check_veto(execution_side)
         if btc_vetoed:
-            _stats["btc_breaker_veto"] += 1
+            if rec:
+                _stats["btc_breaker_veto"] += 1
+                _reject(sym, "BTC_VETO", score, execution_side)
             return None
 
         has_wall, _, _, _, _ = order_book.check_walls(sym, px_live, execution_side)
         if has_wall:
-            _stats["wall_veto"] += 1
+            if rec:
+                _stats["wall_veto"] += 1
+                _reject(sym, "WALL", score, execution_side)
             return None
 
         is_spoof, _ = order_book.detect_spoofing(sym, execution_side)
         if is_spoof:
-            _stats["spoof_veto"] += 1
+            if rec:
+                _stats["spoof_veto"] += 1
+                _reject(sym, "SPOOF", score, execution_side)
             return None
 
         risk_profile = DynamicRiskManager.calculate_levels(px_live, execution_side, atr_val)
 
+        if rec: _reject(sym, "PASS", score, execution_side)
         return (sym, orig_direction, score, sigs, px_live, atr_val, regime, bias, risk_profile)
     except Exception as e:
         _log_err(f"scan_one_{sym}", e)
@@ -1403,10 +1482,10 @@ def t_monitor():
         except: pass
         time.sleep(MONITOR_INT)
 
-def scan_all(syms):
+def scan_all(syms, state=None):
     """Scan SELURUH koin sekaligus (paralel) dan kembalikan semua kandidat yang lolos semua filter."""
     res = []
-    fut = {_executor.submit(scan_one, s): s for s in syms}
+    fut = {_executor.submit(scan_one, s, state): s for s in syms}
     try:
         for f in as_completed(fut, timeout=5):
             try:
@@ -1455,20 +1534,104 @@ def t_slot_filler(syms):
             _log_err("t_slot_filler", e)
         time.sleep(FULL_SCAN_INTERVAL)
 
+def prepared_candidates(outcome, valid_syms):
+    """Kandidat yang sudah disiapkan saat HOLD untuk hasil close tertentu (WIN/LOSS), selama masih segar."""
+    if outcome not in ("WIN", "LOSS"):
+        return []
+    if time.time() - _prepared["ts"] > PREP_MAX_AGE:
+        return []
+    vs = set(valid_syms)
+    return [c[0] for c in _prepared.get(outcome, []) if c[0] in vs]
+
 def t_rescan(syms):
+    """Dipicu tiap posisi close. Pakai kandidat yang SUDAH DISIAPKAN saat hold (validasi ulang cepat), fallback scan penuh."""
     while True:
         try:
-            _rescan_q.get(timeout=5)
-            time.sleep(0.05)
+            item = _rescan_q.get(timeout=5)
+            outcome = item if item in ("WIN", "LOSS") else None
             slots = MAX_POSITIONS - len(live_positions)
             if slots <= 0 or ks_check()[0] or weekly_target_check()[0]: continue
 
             now = time.time()
             valid_syms = [s for s in syms if s not in live_positions and now >= _coin_cooldown.get(s, 0)]
-            res = scan_all(valid_syms)
+
+            res = []
+            prep = prepared_candidates(outcome, valid_syms)
+            if prep:
+                futs = [_executor.submit(scan_one, s) for s in prep]
+                for f in futs:
+                    try:
+                        r = f.result(timeout=3)
+                        if r: res.append(r)
+                    except Exception:
+                        pass
+                if res:
+                    print(f"\n  ⚡ [PREPARED ENTRY] Kandidat sudah disiapkan saat HOLD (hasil: {outcome}) -> validasi ulang lolos, eksekusi instan")
+
+            if not res:
+                res = scan_all(valid_syms)
             if res:
                 open_best(res, slots)
         except: pass
+
+def t_prepare(syms):
+    """
+    SIAP DUA KONDISI: selama posisi masih HOLD, terus scan untuk 2 skenario sekaligus —
+    jika posisi berakhir WIN (mode tetap) dan jika berakhir LOSS (mode flip) — lalu simpan kandidat terbaik masing-masing.
+    """
+    while True:
+        try:
+            held = None
+            with _lock:
+                for s_, p_ in live_positions.items():
+                    if not p_.get("_r") and not p_.get("_closing"):
+                        held = (s_, p_["side"]); break
+
+            if held is None or ks_check()[0] or weekly_target_check()[0]:
+                time.sleep(PREP_SCAN_INTERVAL); continue
+
+            hs, hside = held
+            now = time.time()
+            cand = [s_ for s_ in syms if s_ != hs and now >= _coin_cooldown.get(s_, 0)]
+            snap = {}
+            for outcome in ("WIN", "LOSS"):
+                st = predict_state(outcome, hside)
+                ranked = rank_candidates(scan_all(cand, st))
+                snap[outcome] = [(r[0], r[1], r[2]) for r in ranked[:PREP_TOP_N]]
+
+            _prepared["WIN"], _prepared["LOSS"] = snap["WIN"], snap["LOSS"]
+            _prepared["sym"] = hs
+            _prepared["ts"] = time.time()
+        except Exception as e:
+            _log_err("t_prepare", e)
+        time.sleep(PREP_SCAN_INTERVAL)
+
+def scan_report() -> str:
+    """Ringkasan kenapa tidak entry: jumlah koin per alasan penolakan + near-miss skor."""
+    now = time.time()
+    snap = {k: v for k, v in dict(_last_reject).items() if now - v[4] < 10}
+    if not snap:
+        return "  🔎 [SCAN] belum ada data scan terbaru"
+    counts = defaultdict(int)
+    near = []
+    for s_, (reason, sc, side, req, _ts) in snap.items():
+        counts[reason] += 1
+        if reason == "LOW_SCORE" and sc is not None and req is not None:
+            near.append((sc, s_, side, req))
+    near.sort(reverse=True)
+    parts = " | ".join(f"{k}:{v}" for k, v in sorted(counts.items(), key=lambda x: -x[1]))
+    line = f"  🔎 [SCAN {len(snap)} koin] {parts}"
+    rel = score_relax()
+    if rel:
+        line += f" | IdleRelax:-{rel}"
+    if near:
+        line += "\n     Near-miss skor: " + ", ".join(f"{s_} {side} {sc:.0f}/{req:.0f}" for sc, s_, side, req in near[:3])
+    return line
+
+def prepared_report() -> str:
+    age = time.time() - _prepared["ts"]
+    fmt = lambda lst: ", ".join(f"{c[0]} {c[1]} {c[2]:.0f}" for c in lst[:3]) or "-"
+    return f"  ⚡ [SIAP] (umur {age:.0f}s) Jika WIN -> {fmt(_prepared['WIN'])} | Jika LOSS -> {fmt(_prepared['LOSS'])}"
 
 def t_macro():
     while True:
@@ -1586,6 +1749,7 @@ def run_bot():
     threading.Thread(target=t_monitor, daemon=True).start()
     threading.Thread(target=t_slot_filler, args=(syms,), daemon=True).start()
     threading.Thread(target=t_rescan, args=(syms,), daemon=True).start()
+    threading.Thread(target=t_prepare, args=(syms,), daemon=True).start()
     threading.Thread(target=t_macro, daemon=True).start()
 
     _rescan_q.put(1)
@@ -1606,6 +1770,11 @@ def run_bot():
         elif (k := ks_check())[0]: print(f"  🚨 KS:{k[1]}")
         elif slots == 0: print(f"  ✅ Slots Full — Monitoring Posisi Terbuka")
         else: print(f"  🔍 Slot Kosong — Scanning Signal ({'DEMO' if USE_DEMO_ACCOUNT else 'REAL'} | Mode: {mode_str}{forced_str})...")
+        if cycle % SCAN_REPORT_EVERY == 0:
+            if slots > 0 and not wk_target[0]:
+                print(scan_report())
+            elif slots == 0 and _prepared["ts"] > 0:
+                print(prepared_report())
         if cycle % 30 == 0: print_full()
         time.sleep(SCAN_INTERVAL)
 
