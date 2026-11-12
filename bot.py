@@ -16,6 +16,14 @@ PERBAIKAN TAMBAHAN (hotfix):
 - NO-PAUSE ENGINE (v23.6): saat posisi masih HOLD, bot terus scan untuk 2 skenario sekaligus (jika WIN / jika LOSS) dan menyimpan
   kandidat terbaik masing-masing. Begitu posisi close, kandidat yang sudah siap divalidasi ulang & langsung dieksekusi.
   Ditambah SCAN REPORT (alasan kenapa tidak entry) dan IDLE RELAX (skor minimal turun bertahap kalau terlalu lama menganggur).
+- FIX SUMBER DATA (v23.8): ThreadedWebsocketManager TIDAK diberi testnet=True sehingga WebSocket (kline, harga live, order book,
+  ticker, BTC) memakai MAINNET sementara REST/order memakai TESTNET -> indikator, harga TP/SL, wall/spoof berasal dari market
+  yang berbeda dari tempat order dieksekusi. Sekarang WebSocket mengikuti USE_DEMO_ACCOUNT. Ditambah FEED CHECK saat startup,
+  guard konsistensi candle (gap/loncatan -> resync dari REST), cek data basi (kline/order book), dan DATA HEALTH report
+  (termasuk dominasi klasemen #1) untuk membongkar koin yang "lengket".
+- KLASEMEN REAL-TIME (v23.7): tiap koin dianalisa SEKALI (skor LONG & SHORT) lalu disusun klasemen untuk tiap skenario.
+  Saat HOLD: klasemen 3 terbaik untuk "jika WIN" dan "jika LOSS" diperbarui terus (koin yang tak cocok lagi otomatis diganti).
+  Saat slot kosong: klasemen live 3 terbaik + alasan penolakan ditampilkan di SCAN REPORT.
 - FIX SIGNAL LAG (v23.5): semua indikator/sinyal sekarang membaca candle CLOSED TERBARU (iloc[-1]); sebelumnya iloc[-2]
   sehingga sinyal tertinggal 5-10 menit. Cache candle hanya berisi candle closed. INVERTED_MIN_SCORE diturunkan ke 50.
 - FIX DEADLOCK INVERTED: di mode INVERTED arah eksekusi sudah dikunci, jadi bot TIDAK lagi
@@ -71,12 +79,19 @@ MARK_PRICE_FAST = False
 
 WITA_TZ = timezone(timedelta(hours=8))
 
+_ws_testnet = False   # True kalau WebSocket benar-benar terhubung ke testnet
+
 def _create_twm():
+    global _ws_testnet
     kwargs = {"api_key": api_key, "api_secret": api_secret}
     try:
         params = inspect.signature(ThreadedWebsocketManager.__init__).parameters
         if "max_queue_size" in params:
             kwargs["max_queue_size"] = WS_MAX_QUEUE_SIZE
+        # FIX SUMBER DATA: default python-binance = MAINNET. Harus eksplisit testnet kalau akun demo.
+        if "testnet" in params:
+            kwargs["testnet"] = USE_DEMO_ACCOUNT
+            _ws_testnet = bool(USE_DEMO_ACCOUNT)
     except Exception:
         pass
     try:
@@ -140,6 +155,16 @@ PREP_SCAN_INTERVAL   = 1.0    # saat HOLD: seberapa sering menyiapkan kandidat W
 PREP_TOP_N           = 5      # jumlah kandidat teratas yang disiapkan per skenario
 PREP_MAX_AGE         = 10.0   # kandidat siap dianggap basi setelah N detik (fallback ke scan penuh)
 SCAN_REPORT_EVERY    = 10     # tampilkan SCAN REPORT tiap N siklus (siklus = 2 detik)
+BOARD_PRINT_MIN_SEC  = 8      # klasemen saat HOLD dicetak saat ada perubahan, minimal berjarak N detik
+BOARD_HEARTBEAT_SEC  = 60     # cetak klasemen walau tidak berubah tiap N detik
+
+# Data Integrity
+KLINE_INTERVAL_MS       = 300000   # 5 menit
+STALE_CANDLE_SEC        = 660      # candle closed terakhir lebih tua dari ini = data basi (koin ditolak + resync)
+BOOK_STALE_SEC          = 10.0     # order book lebih tua dari ini = tidak dipercaya (koin ditolak: NO_BOOK)
+RESYNC_COOLDOWN_SEC     = 300      # jeda minimal resync candle per koin
+CANDLE_JUMP_RESYNC_PCT  = 0.02     # loncatan harga antar candle > 2% = anggap sumber data tidak nyambung -> resync
+HEALTH_REPORT_EVERY     = 150      # cetak DATA HEALTH tiap N siklus (150 siklus = 5 menit)
 
 # Idle Relax: kalau slot kosong terlalu lama, skor minimal turun bertahap (Filter 1 tidak disentuh)
 IDLE_RELAX_ENABLED   = True
@@ -549,6 +574,30 @@ class SignalScorer:
             return side, score, sigs, atr, regime, bias
         return None, score, [], atr, regime, bias
 
+    def score_both(self, df: pd.DataFrame, symbol: str):
+        """
+        Skor LONG & SHORT sekaligus (sudah termasuk penyesuaian BTC trend), supaya tiap koin cukup dianalisa SEKALI
+        lalu hasilnya dipakai untuk semua skenario (live / jika WIN / jika LOSS).
+        Return: (long_score, long_sigs, short_score, short_sigs, atr, regime, bias)
+        """
+        if df is None or len(df) < 55:
+            return 0, [], 0, [], 0.0, "UNKNOWN", 0.0
+
+        regime, strength, bias = MarketRegime.detect(df)
+        long_score, long_sigs = self._score_long(df, symbol)
+        short_score, short_sigs = self._score_short(df, symbol)
+        atr = df["atr"].iloc[-1]
+
+        btc_reg = _btc_macro.get("regime", "UNKNOWN")
+        if btc_reg == MarketRegime.REGIME_TRENDING_BULL:
+            long_score += 10; long_sigs.append("BTC_BullTrend[+10]")
+            short_score -= 20
+        elif btc_reg == MarketRegime.REGIME_TRENDING_BEAR:
+            short_score += 10; short_sigs.append("BTC_BearTrend[+10]")
+            long_score -= 20
+
+        return long_score, long_sigs, short_score, short_sigs, atr, regime, bias
+
     def _score_long(self, df: pd.DataFrame, symbol: str) -> Tuple[int, List[str]]:
         row, prev, prev2 = df.iloc[-1], df.iloc[-2], df.iloc[-3]
         score, signals = 0, []
@@ -680,7 +729,14 @@ _hot_syms        = deque(maxlen=30)
 _coin_cooldown   = {}  # Track timestamp exit per symbol
 _last_traded_sym = None  # koin terakhir yang ditradingkan (untuk penalti ranking)
 _flat_since      = time.time()  # kapan slot terakhir kosong (untuk Idle Relax)
-_prepared        = {"WIN": [], "LOSS": [], "ts": 0.0, "sym": None}  # kandidat siap saat HOLD
+_prepared        = {"WIN": [], "LOSS": [], "ts": 0.0, "sym": None, "side": None,
+                    "board": {"WIN": [], "LOSS": []}, "labels": {}}  # kandidat & klasemen siap saat HOLD
+_live_board      = {"entries": [], "ts": 0.0}  # klasemen live saat slot kosong
+_active_syms     = []   # daftar koin aktif (diisi di run_bot)
+_last_resync     = {}   # kapan terakhir tiap koin di-resync dari REST
+_feed            = {"book_ok": True}   # False kalau feed order book hampir mati total (cek NO_BOOK dimatikan sementara)
+_health          = {"scans": 0, "f1_pass_sum": 0, "top1": defaultdict(int),
+                    "STALE_DATA": defaultdict(int), "NO_BOOK": defaultdict(int)}
 _last_reject     = {}   # diagnostik: alasan terakhir tiap koin tidak lolos
 
 _ws_mark_price   = {}
@@ -910,7 +966,17 @@ def _bootstrap_klines(symbol, interval, limit=100):
         _log_err(f"bootstrap_klines_{symbol}", e)
         return None
 
+def _request_resync(symbol, reason):
+    """Bangun ulang cache candle 1 koin dari REST (dibatasi per koin) kalau terdeteksi gap / loncatan harga / data basi."""
+    now = time.time()
+    if now - _last_resync.get(symbol, 0.0) < RESYNC_COOLDOWN_SEC:
+        return
+    _last_resync[symbol] = now
+    print(f"  🔁 [RESYNC] {symbol}: {reason} -> bangun ulang candle dari REST")
+    threading.Thread(target=_bootstrap_klines, args=(symbol, Client.KLINE_INTERVAL_5MINUTE, 100), daemon=True).start()
+
 def _append_kline_from_ws(symbol, k):
+    need_resync = None
     try:
         base_cols = ["time","open","high","low","close","volume","ct","qv","trades","tbbase","tbquote","ignore"]
         new_row = {
@@ -924,12 +990,28 @@ def _append_kline_from_ws(symbol, k):
             if df is None: return
             if len(df) > 0 and int(df.iloc[-1]["time"]) == new_row["time"]:
                 df = df.iloc[:-1]
-            df_base = df[base_cols] if all(c in df.columns for c in base_cols) else df
-            df_base = pd.concat([df_base, pd.DataFrame([new_row])], ignore_index=True)
-            if len(df_base) > 300: df_base = df_base.iloc[-300:].reset_index(drop=True)
-            _kline_cache[symbol] = _compute_indicators(df_base)
+
+            # GUARD KONSISTENSI DATA: candle WS harus nyambung dengan cache. Kalau ada gap candle atau harga loncat
+            # (mis. sumber REST dan WebSocket beda market) -> jangan ditempel, bangun ulang dari REST.
+            if len(df) > 0:
+                last_t = int(df.iloc[-1]["time"])
+                prev_close = float(df.iloc[-1]["close"])
+                gap = new_row["time"] - last_t
+                jump = abs(new_row["open"] - prev_close) / prev_close if prev_close > 0 else 0.0
+                if gap > KLINE_INTERVAL_MS * 1.5:
+                    need_resync = f"gap {gap / KLINE_INTERVAL_MS:.0f} candle"
+                elif jump > CANDLE_JUMP_RESYNC_PCT:
+                    need_resync = f"loncatan harga {jump * 100:.1f}% antar candle (sumber data tidak konsisten?)"
+
+            if need_resync is None:
+                df_base = df[base_cols] if all(c in df.columns for c in base_cols) else df
+                df_base = pd.concat([df_base, pd.DataFrame([new_row])], ignore_index=True)
+                if len(df_base) > 300: df_base = df_base.iloc[-300:].reset_index(drop=True)
+                _kline_cache[symbol] = _compute_indicators(df_base)
     except Exception as e:
         _log_err(f"append_kline_{symbol}", e)
+    if need_resync:
+        _request_resync(symbol, need_resync)
 
 def ohlcv(symbol, interval, limit=100):
     with _kline_lock:
@@ -1317,29 +1399,32 @@ def monitor_positions():
 #  SCANNER THREAD & STRICT FILTERS
 # ═══════════════════════════════════════════════════════════════════════════
 
-def scan_one(sym, state=None):
-    """
-    Evaluasi 1 koin. state = (is_inverted, forced_side, last_failed_side).
-    state=None -> pakai state LIVE saat ini (dan hasilnya dicatat ke diagnostik).
-    state diisi -> dipakai untuk menyiapkan kandidat skenario WIN/LOSS saat posisi masih HOLD.
-    """
-    rec = state is None
-    if state is None:
-        state = (is_logic_inverted, _inverted_forced_side, _last_failed_execution_side)
-    inv_now, forced_now, failed_side = state
+def _live_state():
+    return (is_logic_inverted, _inverted_forced_side, _last_failed_execution_side)
 
+def analyze_coin(sym):
+    """
+    Analisa 1 koin SEKALI saja: cooldown, data, Filter 1, skor LONG & SHORT (sudah termasuk penyesuaian BTC trend),
+    harga live, dan veto real-time (BTC breaker / wall / spoofing) untuk masing-masing arah.
+    Hasilnya dipakai ulang untuk semua skenario (live, jika WIN, jika LOSS) tanpa menghitung ulang -> scan cepat.
+    Return dict {"sym", "reject"} kalau koin gugur, atau dict analisa lengkap.
+    """
     try:
         if time.time() < _coin_cooldown.get(sym, 0):
-            if rec: _reject(sym, "COOLDOWN")
-            return None
+            return {"sym": sym, "reject": "COOLDOWN"}
 
-        time.sleep(0.002)
         df = ohlcv(sym, Client.KLINE_INTERVAL_5MINUTE, 100)
         if df is None:
-            if rec: _reject(sym, "NO_DATA")
-            return None
+            return {"sym": sym, "reject": "NO_DATA"}
+
+        # DATA BASI: candle closed terakhir harus baru. Kalau feed koin ini macet, indikatornya beku dan skornya 'lengket'.
+        candle_age = time.time() - float(df["ct"].iloc[-1]) / 1000.0
+        if candle_age > STALE_CANDLE_SEC:
+            _request_resync(sym, f"candle basi {candle_age:.0f}s")
+            return {"sym": sym, "reject": "STALE_DATA"}
+
         df_ta = run_ta(df.copy())
-        
+
         last_row = df_ta.iloc[-1]
         px_candle = last_row["close"]
         atr_val   = last_row["atr"]
@@ -1347,8 +1432,7 @@ def scan_one(sym, state=None):
         adx_val   = last_row.get("adx", 0.0)
 
         if px_candle == 0 or np.isnan(atr_val):
-            if rec: _reject(sym, "NO_DATA")
-            return None
+            return {"sym": sym, "reject": "NO_DATA"}
 
         # ── FILTER 1: Volume & Sideway Guard ─────────────────────────
         f1 = []
@@ -1356,71 +1440,123 @@ def scan_one(sym, state=None):
         if adx_val < MIN_ADX_TREND: f1.append("adx")
         if (atr_val / px_candle) < MIN_ATR_PCT: f1.append("atr")
         if f1:
-            if rec:
-                _stats["low_vol_veto"] += 1
-                _reject(sym, "F1:" + "+".join(f1))
-            return None
+            return {"sym": sym, "reject": "F1:" + "+".join(f1)}
 
-        # BEST PICK: mode INVERTED -> hitung skor khusus arah yang dikunci (cari koin terbaik utk arah itu).
-        # Mode NORMAL -> arah bebas, ambil sinyal terkuat (LONG/SHORT) dari analisa.
-        if inv_now and forced_now:
-            execution_side = forced_now
-            orig_direction, score, sigs, _, regime, bias = scorer.get_side_signal(df_ta, sym, execution_side)
-            if orig_direction is None:
-                if rec: _reject(sym, "LOW_SCORE", score, execution_side, INVERTED_MIN_SCORE - score_relax())
-                return None
-        else:
-            orig_direction, score, sigs, _, regime, bias = scorer.get_signal(df_ta, sym)
-            if orig_direction is None or orig_direction not in ("LONG", "SHORT"):
-                if rec: _reject(sym, "LOW_SCORE", score, "-", MIN_SCORE - score_relax())
-                return None
-            execution_side = orig_direction
-
-        # ── FILTER 2: DIRECTIONAL SAME-SIDE LOSS GUARD ─────────────────────
-        if failed_side is not None and execution_side == failed_side:
-            required_score = MIN_SCORE + SAME_SIDE_EXTRA_SCORE
-            m5_val = last_row.get("m5", 0.0)
-            trend_aligned = (execution_side == "LONG" and m5_val > 0.001) or (execution_side == "SHORT" and m5_val < -0.001)
-
-            if score < required_score or adx_val < 25.0 or not trend_aligned:
-                if rec:
-                    _stats["same_side_veto"] += 1
-                    _reject(sym, "SAME_SIDE", score, execution_side, required_score)
-                return None
+        long_score, long_sigs, short_score, short_sigs, atr, regime, bias = scorer.score_both(df_ta, sym)
 
         px_live = price_live(sym)
         if px_live == 0:
-            if rec: _reject(sym, "NO_PRICE")
-            return None
+            return {"sym": sym, "reject": "NO_PRICE"}
 
-        btc_vetoed, _ = btc_macro.check_veto(execution_side)
-        if btc_vetoed:
-            if rec:
-                _stats["btc_breaker_veto"] += 1
-                _reject(sym, "BTC_VETO", score, execution_side)
-            return None
+        # ORDER BOOK harus segar: koin tanpa order book TIDAK boleh lolos begitu saja (tanpa cek wall/spoof/imbalance
+        # koin itu diuntungkan secara sistematis dibanding koin lain).
+        if _feed["book_ok"]:
+            bk = order_book.get_book(sym)
+            if bk is None or (time.time() - bk["ts"]) > BOOK_STALE_SEC:
+                return {"sym": sym, "reject": "NO_BOOK"}
 
-        has_wall, _, _, _, _ = order_book.check_walls(sym, px_live, execution_side)
-        if has_wall:
-            if rec:
-                _stats["wall_veto"] += 1
-                _reject(sym, "WALL", score, execution_side)
-            return None
+        sides = {}
+        for side, sc, sg in (("LONG", long_score, long_sigs), ("SHORT", short_score, short_sigs)):
+            veto = None
+            if btc_macro.check_veto(side)[0]:
+                veto = "BTC_VETO"
+            elif order_book.check_walls(sym, px_live, side)[0]:
+                veto = "WALL"
+            elif order_book.detect_spoofing(sym, side)[0]:
+                veto = "SPOOF"
+            sides[side] = {"score": sc, "sigs": sg, "veto": veto}
 
-        is_spoof, _ = order_book.detect_spoofing(sym, execution_side)
-        if is_spoof:
-            if rec:
-                _stats["spoof_veto"] += 1
-                _reject(sym, "SPOOF", score, execution_side)
-            return None
-
-        risk_profile = DynamicRiskManager.calculate_levels(px_live, execution_side, atr_val)
-
-        if rec: _reject(sym, "PASS", score, execution_side)
-        return (sym, orig_direction, score, sigs, px_live, atr_val, regime, bias, risk_profile)
+        return {
+            "sym": sym, "price": px_live, "atr": atr_val, "regime": regime, "bias": bias,
+            "adx": adx_val, "m5": last_row.get("m5", 0.0), "sides": sides,
+        }
     except Exception as e:
-        _log_err(f"scan_one_{sym}", e)
-        return None
+        _log_err(f"analyze_{sym}", e)
+        return {"sym": sym, "reject": "ERROR"}
+
+def entries_for_state(analyses, state):
+    """
+    Dari hasil analisa, bentuk KLASEMEN untuk satu state (is_inverted, forced_side, last_failed_side):
+      - INVERTED : semua koin dinilai untuk arah yang dikunci.
+      - NORMAL   : tiap koin dinilai untuk arah yang lebih kuat (LONG/SHORT), arah bebas.
+    Tiap entri punya status: PASS (siap entry) / LOW_SCORE / SAME_SIDE / veto (WALL, SPOOF, BTC_VETO).
+    Urutan: skor tertinggi dulu (koin yang baru ditrading kena penalti), tie-break: selisih skor vs arah sebaliknya (conviction).
+    """
+    inv, forced, failed_side = state
+    relax = score_relax()
+    entries = []
+    for a in analyses:
+        if not a or "reject" in a:
+            continue
+        L, S = a["sides"]["LONG"], a["sides"]["SHORT"]
+        if inv and forced:
+            side, req = forced, INVERTED_MIN_SCORE - relax
+        else:
+            side, req = ("LONG" if L["score"] >= S["score"] else "SHORT"), MIN_SCORE - relax
+        me, opp = (L, S) if side == "LONG" else (S, L)
+        score = me["score"]
+
+        # FILTER 2: DIRECTIONAL SAME-SIDE LOSS GUARD
+        guard_applies = failed_side is not None and side == failed_side
+        guard_ok = True
+        if guard_applies:
+            req = max(req, MIN_SCORE + SAME_SIDE_EXTRA_SCORE)
+            m5v = a["m5"]
+            trend_aligned = (side == "LONG" and m5v > 0.001) or (side == "SHORT" and m5v < -0.001)
+            guard_ok = a["adx"] >= 25.0 and trend_aligned
+
+        if score < req:
+            status = "LOW_SCORE"
+        elif not guard_ok:
+            status = "SAME_SIDE"
+        elif me["veto"]:
+            status = me["veto"]
+        else:
+            status = "PASS"
+
+        entries.append({
+            "sym": a["sym"], "side": side, "score": score, "req": req, "status": status,
+            "ok": status == "PASS", "veto": me["veto"], "edge": score - opp["score"], "sigs": me["sigs"],
+            "px": a["price"], "atr": a["atr"], "regime": a["regime"], "bias": a["bias"],
+        })
+
+    entries.sort(
+        key=lambda e: (e["score"] - (SAME_COIN_RANK_PENALTY if e["sym"] == _last_traded_sym else 0), e["edge"]),
+        reverse=True,
+    )
+    return entries
+
+def entry_to_tuple(e):
+    risk = DynamicRiskManager.calculate_levels(e["px"], e["side"], e["atr"])
+    return (e["sym"], e["side"], e["score"], e["sigs"], e["px"], e["atr"], e["regime"], e["bias"], risk)
+
+_VETO_STAT = {"WALL": "wall_veto", "SPOOF": "spoof_veto", "BTC_VETO": "btc_breaker_veto", "SAME_SIDE": "same_side_veto"}
+
+def record_diagnostics(analyses, entries):
+    """Catat alasan tiap koin tidak entry (untuk SCAN REPORT) dan update counter dashboard. Hanya untuk scan LIVE."""
+    for a in analyses:
+        if a and "reject" in a:
+            _reject(a["sym"], a["reject"])
+            if a["reject"].startswith("F1:"):
+                _stats["low_vol_veto"] += 1
+    for e in entries:
+        _reject(e["sym"], e["status"], e["score"], e["side"], e["req"])
+        k = _VETO_STAT.get(e["status"])
+        if k:
+            _stats[k] += 1
+
+def scan_one(sym, state=None):
+    """Evaluasi cepat 1 koin (dipakai untuk validasi ulang kandidat siap saat posisi close). Return tuple kandidat atau None."""
+    live = state is None
+    st = _live_state() if live else state
+    a = analyze_coin(sym)
+    entries = entries_for_state([a], st)
+    if live:
+        record_diagnostics([a], entries)
+    for e in entries:
+        if e["ok"]:
+            return entry_to_tuple(e)
+    return None
 
 def scan_batch(syms):
     res = []
@@ -1482,20 +1618,35 @@ def t_monitor():
         except: pass
         time.sleep(MONITOR_INT)
 
-def scan_all(syms, state=None):
-    """Scan SELURUH koin sekaligus (paralel) dan kembalikan semua kandidat yang lolos semua filter."""
-    res = []
-    fut = {_executor.submit(scan_one, s, state): s for s in syms}
+def analyze_all(syms):
+    """Analisa SELURUH koin sekaligus (paralel)."""
+    out = []
+    futs = [_executor.submit(analyze_coin, s) for s in syms]
     try:
-        for f in as_completed(fut, timeout=5):
+        for f in as_completed(futs, timeout=5):
             try:
-                r = f.result(timeout=1)
-                if r: res.append(r)
+                out.append(f.result(timeout=1))
             except Exception:
                 pass
     except Exception:
         pass
-    return res
+    return out
+
+def scan_all(syms, state=None):
+    """
+    Scan SELURUH koin sekaligus dan kembalikan kandidat yang SIAP entry (urut terbaik dulu).
+    state=None -> state LIVE (hasil dicatat ke diagnostik & klasemen live).
+    """
+    live = state is None
+    st = _live_state() if live else state
+    analyses = analyze_all(syms)
+    entries = entries_for_state(analyses, st)
+    if live:
+        record_diagnostics(analyses, entries)
+        _live_board["entries"] = entries
+        _live_board["ts"] = time.time()
+        _health_note(analyses, entries)
+    return [entry_to_tuple(e) for e in entries if e["ok"]]
 
 def rank_candidates(res):
     """Urutkan kandidat: skor tertinggi dulu. Koin yang baru saja ditradingkan kena penalti supaya tidak itu-itu saja."""
@@ -1574,11 +1725,48 @@ def t_rescan(syms):
                 open_best(res, slots)
         except: pass
 
+def _state_label(st):
+    inv, forced, _failed = st
+    return f"INVERTED kunci {forced}" if (inv and forced) else "NORMAL arah bebas"
+
+def _fmt_entry(i, e):
+    sym = e["sym"].replace("USDT", "")
+    if e["ok"]:
+        return f"{i}.{sym} {e['side']} {e['score']:.0f}✅"
+    if e["status"] == "SAME_SIDE":
+        return f"{i}.{sym} {e['side']} {e['score']:.0f}🔒"
+    return f"{i}.{sym} {e['side']} {e['score']:.0f}⏳/{e['req']:.0f}"
+
+def prepare_once(syms, hs, hside):
+    """
+    Satu putaran penyusunan KLASEMEN saat HOLD: analisa semua koin SEKALI, lalu susun klasemen untuk 2 skenario
+    (jika WIN / jika LOSS). Klasemen dihitung ulang tiap putaran, jadi koin yang sudah tidak cocok otomatis diganti
+    koin lain yang lebih baik.
+    """
+    now = time.time()
+    cand = [s_ for s_ in syms if s_ != hs and now >= _coin_cooldown.get(s_, 0)]
+    analyses = analyze_all(cand)
+
+    snap, boards, labels = {}, {}, {}
+    for outcome in ("WIN", "LOSS"):
+        st = predict_state(outcome, hside)
+        es = [e for e in entries_for_state(analyses, st) if e["veto"] is None]   # koin yang kena veto tidak ditampilkan
+        snap[outcome] = [(e["sym"], e["side"], e["score"]) for e in es if e["ok"]][:PREP_TOP_N]
+        boards[outcome] = es[:3]
+        labels[outcome] = _state_label(st)
+
+    _prepared["WIN"], _prepared["LOSS"] = snap["WIN"], snap["LOSS"]
+    _prepared["board"], _prepared["labels"] = boards, labels
+    _prepared["sym"], _prepared["side"] = hs, hside
+    _prepared["ts"] = time.time()
+
 def t_prepare(syms):
     """
-    SIAP DUA KONDISI: selama posisi masih HOLD, terus scan untuk 2 skenario sekaligus —
-    jika posisi berakhir WIN (mode tetap) dan jika berakhir LOSS (mode flip) — lalu simpan kandidat terbaik masing-masing.
+    SIAP DUA KONDISI + KLASEMEN REAL-TIME: selama posisi masih HOLD, scan terus (tidak berhenti walau kandidat sudah ada)
+    dan perbarui klasemen 3 terbaik untuk skenario WIN dan LOSS. Klasemen dicetak tiap ada perubahan (maks. tiap
+    BOARD_PRINT_MIN_SEC detik) dan sebagai heartbeat tiap BOARD_HEARTBEAT_SEC detik.
     """
+    last_sig, last_print = None, 0.0
     while True:
         try:
             held = None
@@ -1588,50 +1776,131 @@ def t_prepare(syms):
                         held = (s_, p_["side"]); break
 
             if held is None or ks_check()[0] or weekly_target_check()[0]:
+                last_sig, last_print = None, 0.0
                 time.sleep(PREP_SCAN_INTERVAL); continue
 
             hs, hside = held
-            now = time.time()
-            cand = [s_ for s_ in syms if s_ != hs and now >= _coin_cooldown.get(s_, 0)]
-            snap = {}
-            for outcome in ("WIN", "LOSS"):
-                st = predict_state(outcome, hside)
-                ranked = rank_candidates(scan_all(cand, st))
-                snap[outcome] = [(r[0], r[1], r[2]) for r in ranked[:PREP_TOP_N]]
+            prepare_once(syms, hs, hside)
 
-            _prepared["WIN"], _prepared["LOSS"] = snap["WIN"], snap["LOSS"]
-            _prepared["sym"] = hs
-            _prepared["ts"] = time.time()
+            sig = tuple((o, tuple((e["sym"], e["side"], e["ok"]) for e in _prepared["board"][o])) for o in ("WIN", "LOSS"))
+            now = time.time()
+            if (sig != last_sig and now - last_print >= BOARD_PRINT_MIN_SEC) or (now - last_print >= BOARD_HEARTBEAT_SEC):
+                print(prepared_report())
+                last_sig, last_print = sig, now
         except Exception as e:
             _log_err("t_prepare", e)
         time.sleep(PREP_SCAN_INTERVAL)
 
 def scan_report() -> str:
-    """Ringkasan kenapa tidak entry: jumlah koin per alasan penolakan + near-miss skor."""
+    """Saat slot kosong: alasan penolakan per koin + klasemen live 3 terbaik (termasuk yang belum cukup skor)."""
     now = time.time()
     snap = {k: v for k, v in dict(_last_reject).items() if now - v[4] < 10}
     if not snap:
         return "  🔎 [SCAN] belum ada data scan terbaru"
     counts = defaultdict(int)
-    near = []
     for s_, (reason, sc, side, req, _ts) in snap.items():
         counts[reason] += 1
-        if reason == "LOW_SCORE" and sc is not None and req is not None:
-            near.append((sc, s_, side, req))
-    near.sort(reverse=True)
     parts = " | ".join(f"{k}:{v}" for k, v in sorted(counts.items(), key=lambda x: -x[1]))
     line = f"  🔎 [SCAN {len(snap)} koin] {parts}"
     rel = score_relax()
     if rel:
         line += f" | IdleRelax:-{rel}"
-    if near:
-        line += "\n     Near-miss skor: " + ", ".join(f"{s_} {side} {sc:.0f}/{req:.0f}" for sc, s_, side, req in near[:3])
+    if now - _live_board["ts"] < 10:
+        shown = [e for e in _live_board["entries"] if e["veto"] is None][:3]
+        if shown:
+            line += "\n     🏁 Klasemen: " + " | ".join(_fmt_entry(i + 1, e) for i, e in enumerate(shown))
     return line
 
 def prepared_report() -> str:
     age = time.time() - _prepared["ts"]
-    fmt = lambda lst: ", ".join(f"{c[0]} {c[1]} {c[2]:.0f}" for c in lst[:3]) or "-"
-    return f"  ⚡ [SIAP] (umur {age:.0f}s) Jika WIN -> {fmt(_prepared['WIN'])} | Jika LOSS -> {fmt(_prepared['LOSS'])}"
+    lines = [f"  🏁 [KLASEMEN SIAP] posisi ditahan: {_prepared['sym']} {_prepared['side']} | umur {age:.0f}s (diperbarui tiap {PREP_SCAN_INTERVAL:.0f}s)"]
+    for o, title in (("WIN", "Jika WIN "), ("LOSS", "Jika LOSS")):
+        b = _prepared["board"].get(o, [])
+        txt = " | ".join(_fmt_entry(i + 1, e) for i, e in enumerate(b)) or "belum ada koin yang lolos Filter 1"
+        lines.append(f"     {title} → {_prepared['labels'].get(o, '-')}: {txt}")
+    return "\n".join(lines)
+
+def _health_note(analyses, entries):
+    """Catat statistik kesehatan data & dominasi klasemen (dipakai health_report)."""
+    _health["scans"] += 1
+    _health["f1_pass_sum"] += sum(1 for a in analyses if a and "reject" not in a)
+    for a in analyses:
+        r = a.get("reject") if a else None
+        if r in ("STALE_DATA", "NO_BOOK"):
+            _health[r][a["sym"]] += 1
+    top = [e for e in entries if e["veto"] is None]
+    if top:
+        _health["top1"][top[0]["sym"]] += 1
+
+def feed_check(syms):
+    """
+    CEK SUMBER DATA saat startup: harga REST (sumber order/candle awal) vs WebSocket (sumber sinyal, harga live, order book).
+    Kalau beda market (mis. REST testnet tapi WebSocket mainnet), indikator & TP/SL jadi kacau dan koin terpilih jadi 'acak/lengket'.
+    """
+    rest_src = "TESTNET" if USE_DEMO_ACCOUNT else "MAINNET"
+    ws_src = "TESTNET" if _ws_testnet else "MAINNET"
+    print(f"\n  🧪 [FEED CHECK] REST/order = {rest_src} | WebSocket = {ws_src}")
+    probe = [s for s in ("BTCUSDT", "ETHUSDT", "NEARUSDT", "1000PEPEUSDT", "DOGEUSDT", "XRPUSDT") if s in syms]
+    worst = 0.0
+    for s in probe:
+        try:
+            rest_px = float(_rest_call(f"feedchk_{s}", client.futures_symbol_ticker, symbol=s)["price"])
+        except Exception:
+            continue
+        ws = _ws_mark_price.get(s)
+        if not ws or ws[0] <= 0:
+            print(f"     {s}: WS mark price belum diterima")
+            continue
+        dev = abs(ws[0] - rest_px) / rest_px * 100
+        worst = max(worst, dev)
+        print(f"     {s}: REST {rest_px:.6g} | WS {ws[0]:.6g} | selisih {dev:.2f}%")
+    if worst > 0.5:
+        print("  ⚠️ SUMBER DATA TIDAK KONSISTEN (selisih > 0.5%) — sinyal/TP/SL bisa salah. Periksa WebSocket vs REST.")
+    elif _ws_src_mismatch(rest_src, ws_src):
+        print("  ⚠️ REST dan WebSocket beda jenis akun — hasil tidak bisa dipercaya.")
+    else:
+        print("  ✅ Sumber data konsisten.")
+    n = max(1, len(syms))
+    now = time.time()
+    fresh_book = sum(1 for s in syms if (order_book.get_book(s) and now - order_book.get_book(s)["ts"] <= BOOK_STALE_SEC))
+    _feed["book_ok"] = fresh_book / n >= 0.5
+    print(f"     Order book segar: {fresh_book}/{len(syms)}" + ("" if _feed["book_ok"] else "  -> feed depth mati, cek NO_BOOK dimatikan sementara"))
+
+def _ws_src_mismatch(rest_src, ws_src):
+    return rest_src != ws_src
+
+def health_report() -> str:
+    """Kesehatan feed data + dominasi klasemen #1 selama periode terakhir. Alat untuk membongkar koin yang 'lengket'."""
+    now = time.time()
+    n = max(1, len(_active_syms))
+    st_k, st_b, st_m, nobook = 0, 0, 0, []
+    for s in _active_syms:
+        df = _kline_cache.get(s)
+        if df is None or len(df) == 0 or now - float(df["ct"].iloc[-1]) / 1000.0 > STALE_CANDLE_SEC:
+            st_k += 1
+        bk = order_book.get_book(s)
+        if bk is None or now - bk["ts"] > BOOK_STALE_SEC:
+            st_b += 1; nobook.append(s.replace("USDT", ""))
+        mp = _ws_mark_price.get(s)
+        if mp is None or now - mp[1] > MARKPRICE_FRESH_SEC:
+            st_m += 1
+    _feed["book_ok"] = (st_b / n) < 0.5   # kalau feed depth hampir mati total, jangan blokir semua koin
+
+    tot = sum(_health["top1"].values())
+    top3 = sorted(_health["top1"].items(), key=lambda x: -x[1])[:3]
+    share = " | ".join(f"{s.replace('USDT', '')} {c * 100 / tot:.0f}%" for s, c in top3) if tot else "-"
+    avg_f1 = _health["f1_pass_sum"] / _health["scans"] if _health["scans"] else 0.0
+    warn = ""
+    if tot and top3 and top3[0][1] / tot > 0.7:
+        warn = f"\n     ⚠️ {top3[0][0]} mendominasi klasemen #1 ({top3[0][1] * 100 / tot:.0f}%) — cek apakah data koin ini wajar."
+    line = (f"  🩺 [DATA HEALTH] kline basi:{st_k}/{n} | depth basi:{st_b}/{n} | markprice basi:{st_m}/{n} | "
+            f"WS:{'TESTNET' if _ws_testnet else 'MAINNET'}\n"
+            f"     Lolos Filter 1 rata-rata: {avg_f1:.1f}/{n} koin | Dominasi klasemen #1: {share}")
+    if nobook and st_b <= 6:
+        line += f"\n     Tanpa order book segar: {', '.join(nobook)}"
+    _health["scans"], _health["f1_pass_sum"] = 0, 0
+    _health["top1"].clear(); _health["STALE_DATA"].clear(); _health["NO_BOOK"].clear()
+    return line + warn
 
 def t_macro():
     while True:
@@ -1741,10 +2010,12 @@ def run_bot():
         twm.start_futures_multiplex_socket(callback=handle_depth_multiplex, streams=depth_streams)
         time.sleep(0.15)
 
+    _active_syms[:] = syms
     print("  ⏳ Memulai Instant Warm-Up: Sinkronisasi data awal WebSocket...")
     for s in syms:   # semua koin di-bootstrap supaya seluruh universe bisa discan sejak awal
         _bootstrap_klines(s, Client.KLINE_INTERVAL_5MINUTE, 100)
-    time.sleep(2.0)
+    time.sleep(4.0)
+    feed_check(syms)
 
     threading.Thread(target=t_monitor, daemon=True).start()
     threading.Thread(target=t_slot_filler, args=(syms,), daemon=True).start()
@@ -1773,8 +2044,8 @@ def run_bot():
         if cycle % SCAN_REPORT_EVERY == 0:
             if slots > 0 and not wk_target[0]:
                 print(scan_report())
-            elif slots == 0 and _prepared["ts"] > 0:
-                print(prepared_report())
+        if cycle % HEALTH_REPORT_EVERY == 0:
+            print(health_report())
         if cycle % 30 == 0: print_full()
         time.sleep(SCAN_INTERVAL)
 
