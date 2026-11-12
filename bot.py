@@ -16,10 +16,10 @@ PERBAIKAN TAMBAHAN (hotfix):
 - NO-PAUSE ENGINE (v23.6): saat posisi masih HOLD, bot terus scan untuk 2 skenario sekaligus (jika WIN / jika LOSS) dan menyimpan
   kandidat terbaik masing-masing. Begitu posisi close, kandidat yang sudah siap divalidasi ulang & langsung dieksekusi.
   Ditambah SCAN REPORT (alasan kenapa tidak entry) dan IDLE RELAX (skor minimal turun bertahap kalau terlalu lama menganggur).
-- FLIP EXECUTION (v23.9): arah ORDER dibalik dari keputusan logika, di mode NORMAL maupun INVERTED
-  (keputusan LONG -> order SHORT, keputusan SHORT -> order LONG). Seluruh logika (skor, mode, guard, klasemen) tetap bekerja
-  di "ruang keputusan"; pembalikan hanya terjadi di eksekusi (live_open), TP/SL, veto order book, dan tampilan.
-  Matikan dengan FLIP_EXECUTION = False.
+- FLIP EKSEKUSI (v23.9): karena hasil historis lebih sering LOSS, arah ORDER dibalik dari keputusan bot:
+  rencana/sinyal LONG -> eksekusi SHORT, rencana/sinyal SHORT -> eksekusi LONG (berlaku di mode NORMAL maupun INVERTED).
+  Seluruh logika mode, klasemen, dan guard tetap bekerja di "ruang rencana"; pembalikan terjadi hanya di titik eksekusi
+  (order, TP/SL, veto wall/spoof/BTC untuk arah yang benar-benar dieksekusi). Matikan dengan FLIP_EXECUTION = False.
 - FIX SUMBER DATA (v23.8): ThreadedWebsocketManager TIDAK diberi testnet=True sehingga WebSocket (kline, harga live, order book,
   ticker, BTC) memakai MAINNET sementara REST/order memakai TESTNET -> indikator, harga TP/SL, wall/spoof berasal dari market
   yang berbeda dari tempat order dieksekusi. Sekarang WebSocket mengikuti USE_DEMO_ACCOUNT. Ditambah FEED CHECK saat startup,
@@ -149,9 +149,6 @@ MAX_SL_PCT        = 0.025
 MAX_HOLD_SECONDS  = 6120   # 1 jam 42 menit
 COIN_COOLDOWN_SEC = 900    # 15 menit cooldown setelah exit per koin
 
-# Arah Eksekusi
-FLIP_EXECUTION = True   # True: arah ORDER dibalik dari keputusan logika (keputusan LONG -> order SHORT & sebaliknya), semua mode
-
 # Best-Pick Scanner
 INVERTED_MIN_SCORE     = 50         # skor minimal arah terkunci di mode INVERTED (sebelumnya sama dgn MIN_SCORE=58)
 SAME_COIN_RANK_PENALTY = 15         # koin yang baru saja ditradingkan diberi penalti ranking (set 0 untuk mematikan)
@@ -164,6 +161,9 @@ PREP_MAX_AGE         = 10.0   # kandidat siap dianggap basi setelah N detik (fal
 SCAN_REPORT_EVERY    = 10     # tampilkan SCAN REPORT tiap N siklus (siklus = 2 detik)
 BOARD_PRINT_MIN_SEC  = 8      # klasemen saat HOLD dicetak saat ada perubahan, minimal berjarak N detik
 BOARD_HEARTBEAT_SEC  = 60     # cetak klasemen walau tidak berubah tiap N detik
+
+# Flip Eksekusi
+FLIP_EXECUTION = True   # True: order dibalik dari rencana (LONG->SHORT, SHORT->LONG). False: perilaku lama.
 
 # Data Integrity
 KLINE_INTERVAL_MS       = 300000   # 5 menit
@@ -195,7 +195,7 @@ BTC_WINDOW_SEC       = 8.0
 BTC_BREAKER_COOLDOWN = 120.0
 
 # Kill Switch
-DAILY_LOSS   = -20.0
+DAILY_LOSS   = -9.0
 CONSEC_MAX   = 15
 CONSEC_PAUSE = 10
 
@@ -1048,11 +1048,11 @@ def ks_upd(pnl):
 #  REAL API BINANCE EXECUTION ENGINE (GUARDED LIVE OPEN & CLOSE)
 # ═══════════════════════════════════════════════════════════════════════════
 
-def flip_side(side):
-    """Arah order dari arah keputusan. FLIP_EXECUTION=True -> dibalik. Nilai selain LONG/SHORT dikembalikan apa adanya."""
-    if not FLIP_EXECUTION or side not in ("LONG", "SHORT"):
-        return side
-    return "SHORT" if side == "LONG" else "LONG"
+def exec_side_of(plan_side):
+    """Arah ORDER yang sebenarnya untuk satu arah rencana/sinyal (dibalik kalau FLIP_EXECUTION aktif)."""
+    if plan_side not in ("LONG", "SHORT") or not FLIP_EXECUTION:
+        return plan_side
+    return "SHORT" if plan_side == "LONG" else "LONG"
 
 def score_relax() -> int:
     """Penurunan skor minimal bertahap kalau slot kosong terlalu lama. Selalu 0 saat ada posisi (termasuk saat menyiapkan kandidat)."""
@@ -1126,14 +1126,12 @@ def live_open(orig_direction, score, sigs, price, atr, regime, bias, sym, risk_p
     # FIX: execution_side & entry_mode ditentukan BERSAMAAN dari state mode yang sama (snapshot),
     # supaya label mode selalu konsisten dengan arah yang benar-benar dieksekusi.
     if is_logic_inverted and _inverted_forced_side:
-        decision_side = _inverted_forced_side
+        plan_side = _inverted_forced_side
         entry_mode = "INVERTED"
     else:
-        decision_side = orig_direction
+        plan_side = orig_direction
         entry_mode = "INVERTED" if is_logic_inverted else "NORMAL"
-
-    # FLIP EXECUTION: arah ORDER = kebalikan dari keputusan logika (kalau FLIP_EXECUTION aktif)
-    execution_side = flip_side(decision_side)
+    execution_side = exec_side_of(plan_side)   # FLIP: arah order = kebalikan dari rencana
 
     with _lock:
         if sym in live_positions or len(live_positions) >= MAX_POSITIONS:
@@ -1189,8 +1187,7 @@ def live_open(orig_direction, score, sigs, price, atr, regime, bias, sym, risk_p
     acc_label = "TESTNET DEMO" if USE_DEMO_ACCOUNT else "REAL MAINNET"
 
     pos = {
-        "side": execution_side,               # arah posisi SEBENARNYA di exchange (dipakai TP/SL, close order, PnL)
-        "decision_side": decision_side,       # arah keputusan logika (dipakai mode NORMAL/INVERTED & same-side guard)
+        "side": execution_side,
         "orig_signal": orig_direction,
         "entry": price,
         "qty": q_val,
@@ -1207,6 +1204,7 @@ def live_open(orig_direction, score, sigs, price, atr, regime, bias, sym, risk_p
         "sl_price": risk["sl_price"],
         "peak_price": price,
         "mode": entry_mode,
+        "plan_side": plan_side,
         "order_id": order_res.get("orderId"),
         "entry_fee": entry_fill["fee"] if entry_fill else None,
     }
@@ -1216,7 +1214,7 @@ def live_open(orig_direction, score, sigs, price, atr, regime, bias, sym, risk_p
 
     d = "🟢" if execution_side == "LONG" else "🔴"
     print(
-        f"\n  {d} [API ORDER EXECUTED] [{acc_label}] {sym} EXEC:{execution_side} (Keputusan:{decision_side}{' → DIBALIK' if FLIP_EXECUTION else ''} | Mode:{entry_mode}) @{price:.6g} | "
+        f"\n  {d} [API ORDER EXECUTED] [{acc_label}] {sym} EXEC:{execution_side} (Rencana:{plan_side}{' -> DIBALIK' if execution_side != plan_side else ''} | Mode:{entry_mode}) @{price:.6g} | "
         f"QTY:{q_val:.8g} | TP:{risk['tp_pct']*100:.2f}% | SL:{risk['sl_pct']*100:.2f}% | In:{pos['open_time_wita']} WITA"
     )
 
@@ -1235,8 +1233,7 @@ def live_close(sym, reason, price=None):
             return
         pos["_closing"] = True
 
-    side = pos["side"]                               # arah posisi sebenarnya
-    dside = pos.get("decision_side", side)           # arah keputusan logika (untuk mode machine)
+    side = pos["side"]
     q_val = pos["qty"]
     close_side = "SELL" if side == "LONG" else "BUY"
 
@@ -1309,25 +1306,25 @@ def live_close(sym, reason, price=None):
     _coin_cooldown[sym] = close_ts + COIN_COOLDOWN_SEC
     _last_traded_sym = sym
 
-    # FIX LOGIC BUG ON INVERTED DIRECTION SWITCH
-    # Mode machine bekerja di ruang KEPUTUSAN (dside), persis seperti sebelumnya; pembalikan hanya di eksekusi.
+    # LOGIKA MODE bekerja di ruang RENCANA (plan_side); eksekusi sudah dibalik di live_open.
+    # Contoh: NORMAL rencana LONG (order SHORT) LOSS -> INVERTED, rencana dikunci SHORT -> order LONG.
+    plan_side = pos.get("plan_side", side)
     if not won:
-        _last_failed_execution_side = dside
+        _last_failed_execution_side = plan_side
 
         if not is_logic_inverted:
             is_logic_inverted = True
-            # Keputusan NORMAL yang LOSS di SHORT -> keputusan dikunci LONG. Yang LOSS di LONG -> dikunci SHORT.
-            _inverted_forced_side = "LONG" if dside == "SHORT" else "SHORT"
-            print(f"  🔄 [MODE CHANGE] Posisi NORMAL {side} (keputusan {dside}) LOSS ({pnl:+.4f}U)! Pindah ke INVERTED — KUNCI arah ORDER ke: {flip_side(_inverted_forced_side)}")
+            _inverted_forced_side = "LONG" if plan_side == "SHORT" else "SHORT"
+            print(f"  🔄 [MODE CHANGE] Posisi NORMAL {side} LOSS ({pnl:+.4f}U)! Pindah ke INVERTED — rencana dikunci {_inverted_forced_side} -> ORDER {exec_side_of(_inverted_forced_side)}")
         else:
             is_logic_inverted = False
             _inverted_forced_side = None
-            print(f"  🔄 [MODE CHANGE] Posisi INVERTED {side} (keputusan {dside}) LOSS ({pnl:+.4f}U)! Pindah ke NORMAL — Arah Bebas Sesuai Sinyal.")
+            print(f"  🔄 [MODE CHANGE] Posisi INVERTED {side} LOSS ({pnl:+.4f}U)! Pindah ke NORMAL — Arah mengikuti sinyal (order dibalik).")
     else:
         _last_failed_execution_side = None
         current_mode = "INVERTED" if is_logic_inverted else "NORMAL"
-        forced_str = f" (Locked ORDER:{flip_side(_inverted_forced_side)})" if _inverted_forced_side else ""
-        print(f"  ✅ [LOGIC STABLE] Posisi {side} (keputusan {dside}) PROFIT ({pnl:+.4f}U)! Mode Tetap: {current_mode}{forced_str}")
+        forced_str = f" (Order terkunci:{exec_side_of(_inverted_forced_side)})" if _inverted_forced_side else ""
+        print(f"  ✅ [LOGIC STABLE] Posisi {side} PROFIT ({pnl:+.4f}U)! Mode Tetap: {current_mode}{forced_str}")
 
     # FIX RACE CONDITION: baru sekarang slot dilepas — mode sudah ter-flip & cooldown koin sudah terpasang,
     # jadi entry berikutnya pasti memakai mode/arah yang benar.
@@ -1373,11 +1370,12 @@ def live_close(sym, reason, price=None):
         "sym": sym, "side": side, "entry": round(entry, 7),
         "exit": round(price, 7), "pnl": round(pnl, 5),
         "gross": round(gross_pnl, 5), "fee": round(fee_entry + fee_exit, 5),
-        "est": (not pnl_synced), "dec": dside,
+        "est": (not pnl_synced),
         "reason": reason, "hold": int(hold),
         "in_wita": open_wita,
         "out_wita": close_wita,
         "mode": entry_mode,
+        "plan": plan_side,
     })
 
     _hot_syms.appendleft(sym)
@@ -1477,12 +1475,11 @@ def analyze_coin(sym):
         sides = {}
         for side, sc, sg in (("LONG", long_score, long_sigs), ("SHORT", short_score, short_sigs)):
             veto = None
-            xside = flip_side(side)   # veto dicek untuk arah ORDER yang akan benar-benar dieksekusi
-            if btc_macro.check_veto(xside)[0]:
+            if btc_macro.check_veto(side)[0]:
                 veto = "BTC_VETO"
-            elif order_book.check_walls(sym, px_live, xside)[0]:
+            elif order_book.check_walls(sym, px_live, side)[0]:
                 veto = "WALL"
-            elif order_book.detect_spoofing(sym, xside)[0]:
+            elif order_book.detect_spoofing(sym, side)[0]:
                 veto = "SPOOF"
             sides[side] = {"score": sc, "sigs": sg, "veto": veto}
 
@@ -1515,6 +1512,8 @@ def entries_for_state(analyses, state):
             side, req = ("LONG" if L["score"] >= S["score"] else "SHORT"), MIN_SCORE - relax
         me, opp = (L, S) if side == "LONG" else (S, L)
         score = me["score"]
+        ex_side = exec_side_of(side)
+        veto = a["sides"][ex_side]["veto"]   # veto real-time (BTC breaker/wall/spoof) dicek untuk arah yang BENAR-BENAR dieksekusi
 
         # FILTER 2: DIRECTIONAL SAME-SIDE LOSS GUARD
         guard_applies = failed_side is not None and side == failed_side
@@ -1529,14 +1528,14 @@ def entries_for_state(analyses, state):
             status = "LOW_SCORE"
         elif not guard_ok:
             status = "SAME_SIDE"
-        elif me["veto"]:
-            status = me["veto"]
+        elif veto:
+            status = veto
         else:
             status = "PASS"
 
         entries.append({
             "sym": a["sym"], "side": side, "score": score, "req": req, "status": status,
-            "ok": status == "PASS", "veto": me["veto"], "edge": score - opp["score"], "sigs": me["sigs"],
+            "ok": status == "PASS", "veto": veto, "exec_side": ex_side, "edge": score - opp["score"], "sigs": me["sigs"],
             "px": a["price"], "atr": a["atr"], "regime": a["regime"], "bias": a["bias"],
         })
 
@@ -1547,7 +1546,7 @@ def entries_for_state(analyses, state):
     return entries
 
 def entry_to_tuple(e):
-    risk = DynamicRiskManager.calculate_levels(e["px"], flip_side(e["side"]), e["atr"])
+    risk = DynamicRiskManager.calculate_levels(e["px"], e["exec_side"], e["atr"])
     return (e["sym"], e["side"], e["score"], e["sigs"], e["px"], e["atr"], e["regime"], e["bias"], risk)
 
 _VETO_STAT = {"WALL": "wall_veto", "SPOOF": "spoof_veto", "BTC_VETO": "btc_breaker_veto", "SAME_SIDE": "same_side_veto"}
@@ -1598,8 +1597,8 @@ def print_inline():
     wr = _stats["wins"] / n * 100 if n else 0
     pnl = _stats["pnl"]
     mode_str = "INVERTED" if is_logic_inverted else "NORMAL"
-    forced_str = f"({flip_side(_inverted_forced_side)})" if _inverted_forced_side else ""
-    failed_str = f"| SameSideLock:{flip_side(_last_failed_execution_side)}" if _last_failed_execution_side else ""
+    forced_str = f"({exec_side_of(_inverted_forced_side)})" if _inverted_forced_side else ""
+    failed_str = f"| SameSideLock:{exec_side_of(_last_failed_execution_side)}" if _last_failed_execution_side else ""
     acc_mode = "DEMO TESTNET" if USE_DEMO_ACCOUNT else "REAL MAINNET"
     print(f"        ┌ [API ENGINE v23.2 ({acc_mode}) - MODE: {mode_str}{forced_str}] {n}T WR:{wr:.0f}% W:{_stats['wins']} L:{_stats['losses']} PnL:{pnl:+.4f}U {failed_str}")
     print(f"        └ TP:{_stats['tp_exit']} SL:{_stats['hard_sl']} TIME_LIMIT:{_stats['time_limit_exit']} | VolVeto:{_stats['low_vol_veto']} | SameSideVeto:{_stats['same_side_veto']} | Weekly:{_weekly_pnl:+.4f}U/${ORDER_USDT:.2f}U")
@@ -1609,9 +1608,9 @@ def print_full():
     wr = _stats["wins"] / n * 100 if n else 0
     pnl = _stats["pnl"]
     mode_str = "INVERTED" if is_logic_inverted else "NORMAL"
-    forced_str = f" [{flip_side(_inverted_forced_side)} ONLY]" if _inverted_forced_side else ""
+    forced_str = f" [{exec_side_of(_inverted_forced_side)} ONLY]" if _inverted_forced_side else ""
     now_wita = datetime.now(tz=WITA_TZ).strftime("%H:%M:%S WITA")
-    failed_str = f" [SAME-SIDE GUARD ACTIVE: {flip_side(_last_failed_execution_side)}]" if _last_failed_execution_side else ""
+    failed_str = f" [SAME-SIDE GUARD ACTIVE: {exec_side_of(_last_failed_execution_side)}]" if _last_failed_execution_side else ""
     acc_mode = "DEMO TESTNET" if USE_DEMO_ACCOUNT else "REAL MAINNET"
     
     print(f"\n  {'─'*72}")
@@ -1628,7 +1627,7 @@ def print_full():
             in_t = t.get("in_wita", "--:--:--")
             out_t = t.get("out_wita", "--:--:--")
             mode_lbl = f"[{t.get('mode', 'NORMAL')}]"
-            print(f"        {em} {t['sym']:<12} {t['side']:<5} sig:{(t.get('dec') or t['side'])[0]} {mode_lbl:<10} {t['pnl']:+.5f}U (G:{t.get('gross', 0.0):+.4f}{'*' if t.get('est') else ''}) {t['hold']}s — {t['reason']:<11} | In:{in_t} Out:{out_t}")
+            print(f"        {em} {t['sym']:<12} {t['side']:<5} {mode_lbl:<10} {t['pnl']:+.5f}U (G:{t.get('gross', 0.0):+.4f}{'*' if t.get('est') else ''}) {t['hold']}s — {t['reason']:<11} | In:{in_t} Out:{out_t}")
     print(f"  {'─'*72}")
 
 def t_monitor():
@@ -1681,7 +1680,7 @@ def open_best(res, slots):
         if len(live_positions) >= MAX_POSITIONS: break
         sym, od, sc, sg, px, atr, regime, bias, risk_profile = r
         others = ", ".join(f"{x[0]}:{x[2]:.0f}" for x in ranked[1:4]) or "-"
-        print(f"\n  🎯 [BEST PICK] {sym} order {flip_side(od)} (keputusan {od}) score:{sc:.0f} (dari {len(ranked)} kandidat lolos) | Runner-up: {others}")
+        print(f"\n  🎯 [BEST PICK] {sym} ORDER:{exec_side_of(od)} (rencana {od}) score:{sc:.0f} (dari {len(ranked)} kandidat lolos) | Runner-up: {others}")
         live_open(od, sc, sg, px, atr, regime, bias, sym, risk_profile)
 
 def t_slot_filler(syms):
@@ -1747,21 +1746,20 @@ def t_rescan(syms):
 
 def _state_label(st):
     inv, forced, _failed = st
-    return f"INVERTED kunci {flip_side(forced)}" if (inv and forced) else "NORMAL arah bebas"
-
-def _fmt_side(e):
-    """Arah ORDER; kalau dibalik tampilkan juga arah sinyal, mis. 'SHORT←L' = order SHORT dari keputusan LONG."""
-    return f"{flip_side(e['side'])}←{e['side'][0]}" if FLIP_EXECUTION else e["side"]
+    if inv and forced:
+        return f"INVERTED order {exec_side_of(forced)}"
+    return "NORMAL order dibalik dari sinyal" if FLIP_EXECUTION else "NORMAL arah bebas"
 
 def _fmt_entry(i, e):
     sym = e["sym"].replace("USDT", "")
+    dirn = f"{e['exec_side']}(sinyal {e['side'][0]})" if e["exec_side"] != e["side"] else e["side"]
     if e["ok"]:
-        return f"{i}.{sym} {_fmt_side(e)} {e['score']:.0f}✅"
+        return f"{i}.{sym} {dirn} {e['score']:.0f}✅"
     if e["status"] == "SAME_SIDE":
-        return f"{i}.{sym} {_fmt_side(e)} {e['score']:.0f}🔒"
-    return f"{i}.{sym} {_fmt_side(e)} {e['score']:.0f}⏳/{e['req']:.0f}"
+        return f"{i}.{sym} {dirn} {e['score']:.0f}🔒"
+    return f"{i}.{sym} {dirn} {e['score']:.0f}⏳/{e['req']:.0f}"
 
-def prepare_once(syms, hs, hside, hexec=None):
+def prepare_once(syms, hs, hside, hside_exec=None):
     """
     Satu putaran penyusunan KLASEMEN saat HOLD: analisa semua koin SEKALI, lalu susun klasemen untuk 2 skenario
     (jika WIN / jika LOSS). Klasemen dihitung ulang tiap putaran, jadi koin yang sudah tidak cocok otomatis diganti
@@ -1781,7 +1779,7 @@ def prepare_once(syms, hs, hside, hexec=None):
 
     _prepared["WIN"], _prepared["LOSS"] = snap["WIN"], snap["LOSS"]
     _prepared["board"], _prepared["labels"] = boards, labels
-    _prepared["sym"], _prepared["side"] = hs, (hexec or flip_side(hside))
+    _prepared["sym"], _prepared["side"] = hs, (hside_exec or hside)
     _prepared["ts"] = time.time()
 
 def t_prepare(syms):
@@ -1797,14 +1795,14 @@ def t_prepare(syms):
             with _lock:
                 for s_, p_ in live_positions.items():
                     if not p_.get("_r") and not p_.get("_closing"):
-                        held = (s_, p_.get("decision_side", p_["side"]), p_["side"]); break
+                        held = (s_, p_["side"], p_.get("plan_side", p_["side"])); break
 
             if held is None or ks_check()[0] or weekly_target_check()[0]:
                 last_sig, last_print = None, 0.0
                 time.sleep(PREP_SCAN_INTERVAL); continue
 
-            hs, hside, hexec = held
-            prepare_once(syms, hs, hside, hexec)
+            hs, hside_exec, hside = held
+            prepare_once(syms, hs, hside, hside_exec)
 
             sig = tuple((o, tuple((e["sym"], e["side"], e["ok"]) for e in _prepared["board"][o])) for o in ("WIN", "LOSS"))
             now = time.time()
@@ -2011,7 +2009,6 @@ def run_bot():
     print(f"║  4. Target Profit Mingguan = ${ORDER_USDT:.2f} (Auto Pause & Reset Senin WITA)║")
     print("║  5. Margin = $3.0 | Max Position = 1 | Timestamp WITA (Makassar)   ║")
     print("╚════════════════════════════════════════════════════════════════════╝")
-    print(f"  🔀 FLIP EXECUTION: {'AKTIF — arah ORDER dibalik dari keputusan logika (NORMAL & INVERTED)' if FLIP_EXECUTION else 'MATI — arah order = keputusan logika'}")
     
     try:
         info = _rest_call("startup_exchange_info", client.futures_exchange_info, retries=0)
@@ -2036,6 +2033,8 @@ def run_bot():
         time.sleep(0.15)
 
     _active_syms[:] = syms
+    if FLIP_EXECUTION:
+        print("  🔀 [FLIP EKSEKUSI AKTIF] Rencana LONG -> order SHORT | Rencana SHORT -> order LONG (mode NORMAL & INVERTED)")
     print("  ⏳ Memulai Instant Warm-Up: Sinkronisasi data awal WebSocket...")
     for s in syms:   # semua koin di-bootstrap supaya seluruh universe bisa discan sejak awal
         _bootstrap_klines(s, Client.KLINE_INTERVAL_5MINUTE, 100)
@@ -2055,9 +2054,9 @@ def run_bot():
         cycle += 1
         slots = MAX_POSITIONS - len(live_positions)
         mode_str = "INVERTED" if is_logic_inverted else "NORMAL"
-        forced_str = f" [{flip_side(_inverted_forced_side)} ONLY]" if _inverted_forced_side else ""
+        forced_str = f" [{exec_side_of(_inverted_forced_side)} ONLY]" if _inverted_forced_side else ""
         now_wita = datetime.now(tz=WITA_TZ).strftime("%H:%M:%S")
-        guard_status = f" | Guard:[{flip_side(_last_failed_execution_side)}]" if _last_failed_execution_side else ""
+        guard_status = f" | Guard:[{exec_side_of(_last_failed_execution_side)}]" if _last_failed_execution_side else ""
         print(f"\n{'═'*68}")
         print(f"  #{cycle} {now_wita} WITA | BTC_5M:{_macro['btc']} Mode:[{mode_str}{forced_str}]{guard_status} ActivePos:({len(live_positions)}/{MAX_POSITIONS}) PnL:{_stats['pnl']:+.4f}U | Weekly:{_weekly_pnl:+.4f}U/${ORDER_USDT:.2f}U")
 
