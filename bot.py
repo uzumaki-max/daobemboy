@@ -1,18 +1,27 @@
 """
-Bot Scalping v23.2 — BINANCE FUTURES LIVE & DEMO EXECUTION ENGINE
+Bot Scalping v23.3 — BINANCE FUTURES LIVE & DEMO EXECUTION ENGINE
 ====================================================================
+UPDATES v23.3:
+- HAPUS SEMUA EXIT BERBASIS WAKTU (MAX_HOLD_SECONDS, stagnant/time-limit exit). Posisi hanya
+  ditutup oleh TP atau SL.
+- TP & SL sekarang FIXED dalam USDT dan otomatis ikut ukuran margin (ORDER_USDT):
+      Profit (TP) per trade = 2/3 x margin
+      Loss   (SL) per trade = 1/3 x margin
+  Contoh: margin $3 -> TP +$2 / SL -$1 | margin $6 -> TP +$4 / SL -$2 | margin $9 -> TP +$6 / SL -$3
+- Harga TP/SL dihitung dari notional asli (qty x harga entry), dan dikompensasi fee (opsional)
+  supaya PnL NET yang kena persis sesuai target.
+- Target mingguan tetap = ORDER_USDT (margin).
+
 UPDATES v23.2:
 - FIXED INVERTED DIRECTION BUG: Memastikan jika NORMAL LOSS di SHORT, INVERTED PASTI LONG (dan sebaliknya).
 - Anti Coin Chaining: Cooldown 15 menit per koin setelah exit.
-- Stagnant Trailing Guard & Safe Order Book Fallback.
+- Safe Order Book Fallback.
 
 PERBAIKAN TAMBAHAN (hotfix):
 - FIX RACE CONDITION: slot posisi sekarang TETAP TERISI selama proses close berlangsung,
   dan baru dilepas SETELAH mode NORMAL/INVERTED di-flip + cooldown koin terpasang.
-  (Sebelumnya scanner bisa entry di tengah proses close dengan mode lama -> LONG setelah LONG loss.)
 - FIX LABEL MODE: entry_mode & execution_side ditentukan bersamaan di awal live_open.
-- FIX DEADLOCK INVERTED: di mode INVERTED arah eksekusi sudah dikunci, jadi bot TIDAK lagi
-  mewajibkan sinyal analisa berlawanan (yang bentrok dengan penalti BTC trend dan membuat bot tidak pernah entry).
+- FIX DEADLOCK INVERTED: di mode INVERTED arah eksekusi sudah dikunci.
 """
 
 import sys
@@ -88,7 +97,7 @@ twm = _create_twm()
 # ═══════════════════════════════════════════════════════════════════════════
 
 LEVERAGE      = 20
-ORDER_USDT    = 6.0
+ORDER_USDT    = 6.0     # MARGIN per trade. TP/SL & target mingguan otomatis ikut nilai ini.
 MAX_POSITIONS = 1
 
 # Strict Volume & Sideway Filters
@@ -111,16 +120,17 @@ REST_418_COOLDOWN = 900.0
 REST_RETRIES = 2
 
 # Scoring & Risk
-MIN_SCORE                  = 58   
-SAME_SIDE_EXTRA_SCORE      = 12   
-ATR_TP_RESTORED_MULTIPLIER = 3.5
-ATR_SL_RESTORED_MULTIPLIER = 1.8
+MIN_SCORE                  = 58
+SAME_SIDE_EXTRA_SCORE      = 12
 
-MIN_TP_PCT        = 0.025
-MAX_TP_PCT        = 0.035
-MIN_SL_PCT        = 0.015
-MAX_SL_PCT        = 0.025
-MAX_HOLD_SECONDS  = 6120   # 1 jam 42 menit
+# ── FIXED USDT RISK (SKALA DENGAN MARGIN) ──────────────────────────────────
+# Profit per trade = TP_MARGIN_RATIO x margin | Loss per trade = SL_MARGIN_RATIO x margin
+#   margin 3 -> TP +2 / SL -1 | margin 6 -> TP +4 / SL -2 | margin 9 -> TP +6 / SL -3
+TP_MARGIN_RATIO   = 2.0 / 3.0
+SL_MARGIN_RATIO   = 1.0 / 3.0
+FEE_RATE          = 0.0004   # taker fee per sisi (0.04%) — dipakai untuk kompensasi fee
+FEE_COMPENSATION  = True     # True = PnL NET (setelah fee) yang kena target TP/SL | False = PnL GROSS
+
 COIN_COOLDOWN_SEC = 900    # 15 menit cooldown setelah exit per koin
 
 # Institutional Order Book
@@ -361,27 +371,49 @@ class AbsorptionDetector:
         return bull_absorb, bear_absorb, " ".join(details)
 
 # ═══════════════════════════════════════════════════════════════════════════
-#  RISK MANAGEMENT
+#  RISK MANAGEMENT — FIXED USDT TP/SL (SKALA DENGAN MARGIN)
 # ═══════════════════════════════════════════════════════════════════════════
 
 class DynamicRiskManager:
     @staticmethod
-    def calculate_levels(entry_price: float, execution_side: str, atr: float) -> Dict[str, float]:
-        atr_pct = (atr / entry_price) if entry_price > 0 else 0.015
+    def calculate_levels(entry_price: float, execution_side: str, atr: float, quantity: float = None) -> Dict[str, float]:
+        """
+        TP/SL ditentukan dari NILAI USDT, bukan dari ATR/persen:
+            TP_USDT = ORDER_USDT * TP_MARGIN_RATIO   (2/3 margin)
+            SL_USDT = ORDER_USDT * SL_MARGIN_RATIO   (1/3 margin)
+        Harga TP/SL = entry +/- (target USDT / notional), notional = quantity x entry
+        (kalau quantity tidak diberikan, dipakai notional ideal = margin x leverage).
+        Jika FEE_COMPENSATION aktif, TP digeser sedikit lebih jauh dan SL sedikit lebih dekat
+        sebesar total fee (buka + tutup) supaya PnL NET kena persis target.
+        """
+        atr_pct = (atr / entry_price) if entry_price > 0 else 0.0
 
-        tp_pct = max(MIN_TP_PCT, min(MAX_TP_PCT, ATR_TP_RESTORED_MULTIPLIER * atr_pct))
-        sl_pct = max(MIN_SL_PCT, min(MAX_SL_PCT, ATR_SL_RESTORED_MULTIPLIER * atr_pct))
+        tp_usdt = ORDER_USDT * TP_MARGIN_RATIO
+        sl_usdt = ORDER_USDT * SL_MARGIN_RATIO
+
+        if quantity and quantity > 0 and entry_price > 0:
+            notional = quantity * entry_price
+        else:
+            notional = ORDER_USDT * LEVERAGE
+
+        fee_total = notional * FEE_RATE * 2 if FEE_COMPENSATION else 0.0
+        tp_gross = tp_usdt + fee_total
+        sl_gross = max(sl_usdt - fee_total, sl_usdt * 0.2)   # jaga supaya SL tidak jadi ~0
+
+        tp_pct = tp_gross / notional
+        sl_pct = sl_gross / notional
 
         if execution_side == "LONG":
             tp_price = entry_price * (1 + tp_pct)
             sl_price = entry_price * (1 - sl_pct)
-        else: # SHORT
+        else:  # SHORT
             tp_price = entry_price * (1 - tp_pct)
             sl_price = entry_price * (1 + sl_pct)
 
         return {
             "tp_pct": tp_pct, "sl_pct": sl_pct,
             "tp_price": tp_price, "sl_price": sl_price,
+            "tp_usdt": tp_usdt, "sl_usdt": sl_usdt,
             "atr_pct": atr_pct
         }
 
@@ -653,6 +685,7 @@ def weekly_target_check() -> Tuple[bool, str]:
         _current_iso_year = iso_year
         _current_iso_week = iso_week
 
+    # Target mingguan = nilai margin (ORDER_USDT) yang dipasang
     target = float(ORDER_USDT)
     if _weekly_pnl >= target:
         with _lock:
@@ -994,7 +1027,8 @@ def live_open(orig_direction, score, sigs, price, atr, regime, bias, sym, risk_p
     else:
         print(f"  ⚠️ [FILL SYNC] Fill ENTRY {sym} belum terbaca dari exchange — entry pakai estimasi harga.")
 
-    risk = DynamicRiskManager.calculate_levels(price, execution_side, atr)
+    # TP/SL fixed USDT: dihitung dari harga entry asli + qty asli
+    risk = DynamicRiskManager.calculate_levels(price, execution_side, atr, quantity=q_val)
     open_ts = time.time()
     acc_label = "TESTNET DEMO" if USE_DEMO_ACCOUNT else "REAL MAINNET"
 
@@ -1014,6 +1048,8 @@ def live_open(orig_direction, score, sigs, price, atr, regime, bias, sym, risk_p
         "sl_pct": risk["sl_pct"],
         "tp_price": risk["tp_price"],
         "sl_price": risk["sl_price"],
+        "tp_usdt": risk["tp_usdt"],
+        "sl_usdt": risk["sl_usdt"],
         "peak_price": price,
         "mode": entry_mode,
         "order_id": order_res.get("orderId"),
@@ -1026,7 +1062,8 @@ def live_open(orig_direction, score, sigs, price, atr, regime, bias, sym, risk_p
     d = "🟢" if execution_side == "LONG" else "🔴"
     print(
         f"\n  {d} [API ORDER EXECUTED] [{acc_label}] {sym} EXEC:{execution_side} (Signal:{orig_direction} | Mode:{entry_mode}) @{price:.6g} | "
-        f"QTY:{q_val:.8g} | TP:{risk['tp_pct']*100:.2f}% | SL:{risk['sl_pct']*100:.2f}% | In:{pos['open_time_wita']} WITA"
+        f"QTY:{q_val:.8g} | TP:+{risk['tp_usdt']:.2f}U ({risk['tp_pct']*100:.2f}%) @{risk['tp_price']:.6g} | "
+        f"SL:-{risk['sl_usdt']:.2f}U ({risk['sl_pct']*100:.2f}%) @{risk['sl_price']:.6g} | In:{pos['open_time_wita']} WITA"
     )
 
     _stats["trades"] += 1
@@ -1172,7 +1209,6 @@ def live_close(sym, reason, price=None):
 
     if reason == "SL": _stats["hard_sl"] += 1
     elif reason == "TP": _stats["tp_exit"] += 1
-    elif "TIME_LIMIT" in reason: _stats["time_limit_exit"] += 1
 
     trade_log.append({
         "sym": sym, "side": side, "entry": round(entry, 7),
@@ -1190,17 +1226,15 @@ def live_close(sym, reason, price=None):
     print_inline()
 
 def monitor_positions():
+    # v23.3: HANYA TP / SL. Tidak ada lagi exit berbasis waktu (stagnant / max hold).
     for sym in list(live_positions.keys()):
         pos = live_positions.get(sym)
         if pos is None or pos.get("_r") or pos.get("_closing"): continue
 
-        hold_time = time.time() - pos["open_time"]
         px = price_live(sym)
         if px == 0: continue
 
-        side, tp_px, sl_px, entry_px = pos["side"], pos["tp_price"], pos["sl_price"], pos["entry"]
-
-        pct_gain = ((px - entry_px) / entry_px * 100) if side == "LONG" else ((entry_px - px) / entry_px * 100)
+        side, tp_px, sl_px = pos["side"], pos["tp_price"], pos["sl_price"]
 
         if side == "LONG":
             if px >= tp_px: live_close(sym, "TP", tp_px); continue
@@ -1208,16 +1242,6 @@ def monitor_positions():
         elif side == "SHORT":
             if px <= tp_px: live_close(sym, "TP", tp_px); continue
             if px >= sl_px: live_close(sym, "SL", sl_px); continue
-
-        if hold_time > 2700 and pct_gain >= 0.8:
-            print(f"  🛡️ {sym}: Position Stagnant tapi sudah Profit ({pct_gain:+.2f}%) — Locking Break-Even/Partial Exit")
-            live_close(sym, "TIME_LIMIT_PROTECTED", px)
-            continue
-
-        if hold_time > MAX_HOLD_SECONDS:
-            print(f"  ⏰ {sym}: MAX_HOLD_SECONDS terlampaui ({hold_time:.0f}s) — TIME_LIMIT close")
-            live_close(sym, "TIME_LIMIT", px)
-            continue
 
 # ═══════════════════════════════════════════════════════════════════════════
 #  SCANNER THREAD & STRICT FILTERS
@@ -1252,7 +1276,6 @@ def scan_one(sym):
 
         # FIX DEADLOCK INVERTED: saat INVERTED arah eksekusi sudah dikunci (_inverted_forced_side),
         # jadi sinyal analisa apa pun (LONG/SHORT) yang lolos filter & skor boleh dipakai.
-        # Sebelumnya wajib sinyal berlawanan, yang bentrok dengan penalti BTC trend (-20) sehingga bot tidak pernah entry.
         if is_logic_inverted and _inverted_forced_side:
             execution_side = _inverted_forced_side
         else:
@@ -1316,8 +1339,8 @@ def print_inline():
     forced_str = f"({_inverted_forced_side})" if _inverted_forced_side else ""
     failed_str = f"| SameSideLock:{_last_failed_execution_side}" if _last_failed_execution_side else ""
     acc_mode = "DEMO TESTNET" if USE_DEMO_ACCOUNT else "REAL MAINNET"
-    print(f"        ┌ [API ENGINE v23.2 ({acc_mode}) - MODE: {mode_str}{forced_str}] {n}T WR:{wr:.0f}% W:{_stats['wins']} L:{_stats['losses']} PnL:{pnl:+.4f}U {failed_str}")
-    print(f"        └ TP:{_stats['tp_exit']} SL:{_stats['hard_sl']} TIME_LIMIT:{_stats['time_limit_exit']} | VolVeto:{_stats['low_vol_veto']} | SameSideVeto:{_stats['same_side_veto']} | Weekly:{_weekly_pnl:+.4f}U/${ORDER_USDT:.2f}U")
+    print(f"        ┌ [API ENGINE v23.3 ({acc_mode}) - MODE: {mode_str}{forced_str}] {n}T WR:{wr:.0f}% W:{_stats['wins']} L:{_stats['losses']} PnL:{pnl:+.4f}U {failed_str}")
+    print(f"        └ TP:{_stats['tp_exit']} SL:{_stats['hard_sl']} | VolVeto:{_stats['low_vol_veto']} | SameSideVeto:{_stats['same_side_veto']} | Weekly:{_weekly_pnl:+.4f}U/${ORDER_USDT:.2f}U")
 
 def print_full():
     n = _stats["wins"] + _stats["losses"]
@@ -1332,9 +1355,10 @@ def print_full():
     print(f"\n  {'─'*72}")
     print(f"    🔔 INSTITUTIONAL SCALPING DASHBOARD ({acc_mode} | MODE: {mode_str}{forced_str}){failed_str} [{now_wita}]")
     print(f"    🎯 {n}T WR:{wr:.0f}% W:{_stats['wins']} L:{_stats['losses']}")
+    print(f"    💰 Margin:${ORDER_USDT:.2f} | TP:+{ORDER_USDT*TP_MARGIN_RATIO:.2f}U | SL:-{ORDER_USDT*SL_MARGIN_RATIO:.2f}U per trade")
     print(f"    PnL Net:{pnl:+.5f}U | Weekly PnL:{_weekly_pnl:+.5f}U / Target:${ORDER_USDT:.2f}U | ATH PnL:{_stats['ath_pnl']:+.5f}U")
     print(f"    🏆 Best Win:{_stats['best']:+.5f}U | 💥 Worst Loss:{_stats['worst']:+.5f}U")
-    print(f"    📈 Exit: TP:{_stats['tp_exit']} | SL:{_stats['hard_sl']} | TimeLimit:{_stats['time_limit_exit']} | VolVeto:{_stats['low_vol_veto']} | SameSideVeto:{_stats['same_side_veto']}")
+    print(f"    📈 Exit: TP:{_stats['tp_exit']} | SL:{_stats['hard_sl']} | VolVeto:{_stats['low_vol_veto']} | SameSideVeto:{_stats['same_side_veto']}")
 
     if trade_log:
         print(f"    {'─'*68}\n    📋 Last 5 Trades (Makassar / WITA Timezone):")
@@ -1484,14 +1508,16 @@ def handle_depth_multiplex(msg):
 
 def run_bot():
     acc_type_str = "BINANCE FUTURES DEMO (TESTNET)" if USE_DEMO_ACCOUNT else "BINANCE FUTURES REAL MAINNET"
+    tp_u = ORDER_USDT * TP_MARGIN_RATIO
+    sl_u = ORDER_USDT * SL_MARGIN_RATIO
     print("╔════════════════════════════════════════════════════════════════════╗")
-    print(f"║  💎 BOT SCALPING v23.2 — LIVE BINANCE API EXECUTION ENGINE         ║")
+    print(f"║  💎 BOT SCALPING v23.3 — LIVE BINANCE API EXECUTION ENGINE         ║")
     print(f"║  MODE AKUN: {acc_type_str:<51} ║")
     print("║  1. Mode Awal: NORMAL (Arah Bebas Sesuai Sinyal Indikator)         ║")
     print("║  2. Strict Filter: Volume Ratio >= 0.85 & ADX >= 20 (Anti-Sideway) ║")
-    print("║  3. FIXED Inverted Lock Engine (SHORT loss -> LONG, LONG loss -> SHORT) ║")
-    print(f"║  4. Target Profit Mingguan = ${ORDER_USDT:.2f} (Auto Pause & Reset Senin WITA)║")
-    print("║  5. Margin = $3.0 | Max Position = 1 | Timestamp WITA (Makassar)   ║")
+    print("║  3. Inverted Lock Engine (SHORT loss -> LONG, LONG loss -> SHORT)  ║")
+    print(f"║  4. Target Mingguan = ${ORDER_USDT:.2f} (sama dengan margin) | Reset Senin WITA  ║")
+    print(f"║  5. Margin=${ORDER_USDT:.2f} | TP=+${tp_u:.2f} | SL=-${sl_u:.2f} per trade | Tanpa limit waktu ║")
     print("╚════════════════════════════════════════════════════════════════════╝")
     
     try:
