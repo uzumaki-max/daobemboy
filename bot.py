@@ -4,10 +4,10 @@ Bot Scalping v23.3 — BINANCE FUTURES LIVE & DEMO EXECUTION ENGINE
 UPDATES v23.3:
 - HAPUS SEMUA EXIT BERBASIS WAKTU (MAX_HOLD_SECONDS, stagnant/time-limit exit). Posisi hanya
   ditutup oleh TP atau SL.
-- TP & SL sekarang FIXED dalam USDT dan otomatis ikut ukuran margin (ORDER_USDT):
-      Profit (TP) per trade = 2/3 x margin
+- TP & SL FIXED dalam USDT dan otomatis ikut ukuran margin (ORDER_USDT):
+      Profit (TP) per trade = 1/2 x margin
       Loss   (SL) per trade = 1/3 x margin
-  Contoh: margin $3 -> TP +$2 / SL -$1 | margin $6 -> TP +$4 / SL -$2 | margin $9 -> TP +$6 / SL -$3
+  Contoh: margin $3 -> TP +$1.5 / SL -$1 | margin $6 -> TP +$3 / SL -$2 | margin $9 -> TP +$4.5 / SL -$3
 - Harga TP/SL dihitung dari notional asli (qty x harga entry), dan dikompensasi fee (opsional)
   supaya PnL NET yang kena persis sesuai target.
 - Target mingguan tetap = ORDER_USDT (margin).
@@ -125,8 +125,8 @@ SAME_SIDE_EXTRA_SCORE      = 12
 
 # ── FIXED USDT RISK (SKALA DENGAN MARGIN) ──────────────────────────────────
 # Profit per trade = TP_MARGIN_RATIO x margin | Loss per trade = SL_MARGIN_RATIO x margin
-#   margin 3 -> TP +2 / SL -1 | margin 6 -> TP +4 / SL -2 | margin 9 -> TP +6 / SL -3
-TP_MARGIN_RATIO   = 2.0 / 3.0
+#   margin 3 -> TP +1.5 / SL -1 | margin 6 -> TP +3 / SL -2 | margin 9 -> TP +4.5 / SL -3
+TP_MARGIN_RATIO   = 1.0 / 2.0
 SL_MARGIN_RATIO   = 1.0 / 3.0
 FEE_RATE          = 0.0004   # taker fee per sisi (0.04%) — dipakai untuk kompensasi fee
 FEE_COMPENSATION  = True     # True = PnL NET (setelah fee) yang kena target TP/SL | False = PnL GROSS
@@ -379,7 +379,7 @@ class DynamicRiskManager:
     def calculate_levels(entry_price: float, execution_side: str, atr: float, quantity: float = None) -> Dict[str, float]:
         """
         TP/SL ditentukan dari NILAI USDT, bukan dari ATR/persen:
-            TP_USDT = ORDER_USDT * TP_MARGIN_RATIO   (2/3 margin)
+            TP_USDT = ORDER_USDT * TP_MARGIN_RATIO   (1/2 margin)
             SL_USDT = ORDER_USDT * SL_MARGIN_RATIO   (1/3 margin)
         Harga TP/SL = entry +/- (target USDT / notional), notional = quantity x entry
         (kalau quantity tidak diberikan, dipakai notional ideal = margin x leverage).
