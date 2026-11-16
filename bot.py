@@ -4,10 +4,11 @@ Bot Scalping v23.3 — BINANCE FUTURES LIVE & DEMO EXECUTION ENGINE
 UPDATES v23.3:
 - HAPUS SEMUA EXIT BERBASIS WAKTU (MAX_HOLD_SECONDS, stagnant/time-limit exit). Posisi hanya
   ditutup oleh TP atau SL.
-- TP & SL FIXED dalam USDT dan otomatis ikut ukuran margin (ORDER_USDT):
-      Profit (TP) per trade = 1/2 x margin
-      Loss   (SL) per trade = 1/3 x margin
-  Contoh: margin $3 -> TP +$1.5 / SL -$1 | margin $6 -> TP +$3 / SL -$2 | margin $9 -> TP +$4.5 / SL -$3
+- TP & SL FIXED dalam USDT, naik bertahap setiap margin naik +$3:
+      Margin $3  -> TP +$1.5 | SL -$1
+      Margin $6  -> TP +$2   | SL -$1.5
+      Margin $9  -> TP +$2.5 | SL -$2
+      Margin $12 -> TP +$3   | SL -$2.5   (dan seterusnya: tiap +$3 margin, TP +$0.5 & SL +$0.5)
 - Harga TP/SL dihitung dari notional asli (qty x harga entry), dan dikompensasi fee (opsional)
   supaya PnL NET yang kena persis sesuai target.
 - Target mingguan tetap = ORDER_USDT (margin).
@@ -123,15 +124,30 @@ REST_RETRIES = 2
 MIN_SCORE                  = 58
 SAME_SIDE_EXTRA_SCORE      = 12
 
-# ── FIXED USDT RISK (SKALA DENGAN MARGIN) ──────────────────────────────────
-# Profit per trade = TP_MARGIN_RATIO x margin | Loss per trade = SL_MARGIN_RATIO x margin
-#   margin 3 -> TP +1.5 / SL -1 | margin 6 -> TP +3 / SL -2 | margin 9 -> TP +4.5 / SL -3
-TP_MARGIN_RATIO   = 1.0 / 2.0
-SL_MARGIN_RATIO   = 1.0 / 3.0
+# ── FIXED USDT RISK (NAIK BERTAHAP SETIAP MARGIN +$3) ──────────────────────
+# Dasar (margin $3): TP +$1.5 | SL -$1.
+# Setiap margin naik +$3 (MARGIN_STEP): TP naik +$0.5 (TP_STEP_USDT) dan SL naik +$0.5 (SL_STEP_USDT).
+#   margin 3 -> TP 1.5 / SL 1 | margin 6 -> TP 2 / SL 1.5 | margin 9 -> TP 2.5 / SL 2 | margin 12 -> TP 3 / SL 2.5
+BASE_MARGIN_USDT = 3.0
+BASE_TP_USDT     = 1.5
+BASE_SL_USDT     = 1.0
+MARGIN_STEP      = 3.0
+TP_STEP_USDT     = 0.5
+SL_STEP_USDT     = 0.5
+
 FEE_RATE          = 0.0004   # taker fee per sisi (0.04%) — dipakai untuk kompensasi fee
 FEE_COMPENSATION  = True     # True = PnL NET (setelah fee) yang kena target TP/SL | False = PnL GROSS
 
 COIN_COOLDOWN_SEC = 900    # 15 menit cooldown setelah exit per koin
+
+def tp_sl_usdt(margin: float = None) -> Tuple[float, float]:
+    """Return (TP_USDT, SL_USDT) per trade berdasarkan margin (default ORDER_USDT)."""
+    if margin is None:
+        margin = ORDER_USDT
+    steps = (margin - BASE_MARGIN_USDT) / MARGIN_STEP
+    tp = BASE_TP_USDT + steps * TP_STEP_USDT
+    sl = BASE_SL_USDT + steps * SL_STEP_USDT
+    return max(tp, 0.01), max(sl, 0.01)
 
 # Institutional Order Book
 WALL_RATIO_THRESHOLD  = 2.5
@@ -371,16 +387,15 @@ class AbsorptionDetector:
         return bull_absorb, bear_absorb, " ".join(details)
 
 # ═══════════════════════════════════════════════════════════════════════════
-#  RISK MANAGEMENT — FIXED USDT TP/SL (SKALA DENGAN MARGIN)
+#  RISK MANAGEMENT — FIXED USDT TP/SL (NAIK BERTAHAP SETIAP MARGIN +$3)
 # ═══════════════════════════════════════════════════════════════════════════
 
 class DynamicRiskManager:
     @staticmethod
     def calculate_levels(entry_price: float, execution_side: str, atr: float, quantity: float = None) -> Dict[str, float]:
         """
-        TP/SL ditentukan dari NILAI USDT, bukan dari ATR/persen:
-            TP_USDT = ORDER_USDT * TP_MARGIN_RATIO   (1/2 margin)
-            SL_USDT = ORDER_USDT * SL_MARGIN_RATIO   (1/3 margin)
+        TP/SL ditentukan dari NILAI USDT (lihat tp_sl_usdt), bukan dari ATR/persen:
+            margin 3 -> TP 1.5 / SL 1 | margin 6 -> TP 2 / SL 1.5 | margin 9 -> TP 2.5 / SL 2 | dst (+0.5 / +0.5 per +$3 margin)
         Harga TP/SL = entry +/- (target USDT / notional), notional = quantity x entry
         (kalau quantity tidak diberikan, dipakai notional ideal = margin x leverage).
         Jika FEE_COMPENSATION aktif, TP digeser sedikit lebih jauh dan SL sedikit lebih dekat
@@ -388,8 +403,7 @@ class DynamicRiskManager:
         """
         atr_pct = (atr / entry_price) if entry_price > 0 else 0.0
 
-        tp_usdt = ORDER_USDT * TP_MARGIN_RATIO
-        sl_usdt = ORDER_USDT * SL_MARGIN_RATIO
+        tp_usdt, sl_usdt = tp_sl_usdt()
 
         if quantity and quantity > 0 and entry_price > 0:
             notional = quantity * entry_price
@@ -1351,11 +1365,12 @@ def print_full():
     now_wita = datetime.now(tz=WITA_TZ).strftime("%H:%M:%S WITA")
     failed_str = f" [SAME-SIDE GUARD ACTIVE: {_last_failed_execution_side}]" if _last_failed_execution_side else ""
     acc_mode = "DEMO TESTNET" if USE_DEMO_ACCOUNT else "REAL MAINNET"
+    tp_u, sl_u = tp_sl_usdt()
     
     print(f"\n  {'─'*72}")
     print(f"    🔔 INSTITUTIONAL SCALPING DASHBOARD ({acc_mode} | MODE: {mode_str}{forced_str}){failed_str} [{now_wita}]")
     print(f"    🎯 {n}T WR:{wr:.0f}% W:{_stats['wins']} L:{_stats['losses']}")
-    print(f"    💰 Margin:${ORDER_USDT:.2f} | TP:+{ORDER_USDT*TP_MARGIN_RATIO:.2f}U | SL:-{ORDER_USDT*SL_MARGIN_RATIO:.2f}U per trade")
+    print(f"    💰 Margin:${ORDER_USDT:.2f} | TP:+{tp_u:.2f}U | SL:-{sl_u:.2f}U per trade")
     print(f"    PnL Net:{pnl:+.5f}U | Weekly PnL:{_weekly_pnl:+.5f}U / Target:${ORDER_USDT:.2f}U | ATH PnL:{_stats['ath_pnl']:+.5f}U")
     print(f"    🏆 Best Win:{_stats['best']:+.5f}U | 💥 Worst Loss:{_stats['worst']:+.5f}U")
     print(f"    📈 Exit: TP:{_stats['tp_exit']} | SL:{_stats['hard_sl']} | VolVeto:{_stats['low_vol_veto']} | SameSideVeto:{_stats['same_side_veto']}")
@@ -1508,8 +1523,7 @@ def handle_depth_multiplex(msg):
 
 def run_bot():
     acc_type_str = "BINANCE FUTURES DEMO (TESTNET)" if USE_DEMO_ACCOUNT else "BINANCE FUTURES REAL MAINNET"
-    tp_u = ORDER_USDT * TP_MARGIN_RATIO
-    sl_u = ORDER_USDT * SL_MARGIN_RATIO
+    tp_u, sl_u = tp_sl_usdt()
     print("╔════════════════════════════════════════════════════════════════════╗")
     print(f"║  💎 BOT SCALPING v23.3 — LIVE BINANCE API EXECUTION ENGINE         ║")
     print(f"║  MODE AKUN: {acc_type_str:<51} ║")
