@@ -1,6 +1,11 @@
 """
 Bot Scalping v23.4 — BINANCE FUTURES LIVE & DEMO EXECUTION ENGINE
 ====================================================================
+UPDATES v23.5:
+- TARGET MINGGUAN OTOMATIS IKUT MARGIN: margin $3 -> target $2/minggu. Setiap margin naik +$3,
+  target mingguan naik +$2 (margin $6 -> $4 | $9 -> $6 | $12 -> $8 | ... | $300 -> $200 | dst).
+  Rumus: target = 2 x (margin / 3). Diatur lewat WEEKLY_BASE_TARGET_USDT & WEEKLY_TARGET_STEP_USDT.
+
 UPDATES v23.4:
 - TAMBAH LOSS TIME LIMIT: kalau posisi terus-menerus minus selama MAX_LOSS_HOLD_SECONDS
   (default 3600 detik = 1 jam), posisi langsung di-cut (reason: LOSS_TIMEOUT).
@@ -160,6 +165,19 @@ def tp_sl_usdt(margin: float = None) -> Tuple[float, float]:
     tp = BASE_TP_USDT + steps * TP_STEP_USDT
     sl = BASE_SL_USDT + steps * SL_STEP_USDT
     return max(tp, 0.01), max(sl, 0.01)
+
+# ── TARGET MINGGUAN (NAIK OTOMATIS MENGIKUTI MARGIN) ───────────────────────
+# Margin $3 -> target $2/minggu. Setiap margin naik +$3 (MARGIN_STEP) -> target naik +$2.
+#   margin 3 -> 2 | margin 6 -> 4 | margin 9 -> 6 | margin 12 -> 8 | ... | margin 300 -> 200 | dst
+WEEKLY_BASE_TARGET_USDT = 2.0   # target mingguan saat margin = BASE_MARGIN_USDT
+WEEKLY_TARGET_STEP_USDT = 2.0   # tambahan target mingguan setiap margin naik +MARGIN_STEP
+
+def weekly_target_usdt(margin: float = None) -> float:
+    """Return target PnL mingguan (USDT) berdasarkan margin (default ORDER_USDT)."""
+    if margin is None:
+        margin = ORDER_USDT
+    steps = (margin - BASE_MARGIN_USDT) / MARGIN_STEP
+    return max(WEEKLY_BASE_TARGET_USDT + steps * WEEKLY_TARGET_STEP_USDT, 0.01)
 
 # Institutional Order Book
 WALL_RATIO_THRESHOLD  = 2.5
@@ -711,8 +729,8 @@ def weekly_target_check() -> Tuple[bool, str]:
         _current_iso_year = iso_year
         _current_iso_week = iso_week
 
-    # Target mingguan = nilai margin (ORDER_USDT) yang dipasang
-    target = float(ORDER_USDT)
+    # Target mingguan otomatis mengikuti margin: $3 -> $2, $6 -> $4, $9 -> $6, dst (+$2 tiap margin +$3)
+    target = weekly_target_usdt()
     if _weekly_pnl >= target:
         with _lock:
             if live_positions:
@@ -1382,8 +1400,8 @@ def print_inline():
     forced_str = f"({_inverted_forced_side})" if _inverted_forced_side else ""
     failed_str = f"| SameSideLock:{_last_failed_execution_side}" if _last_failed_execution_side else ""
     acc_mode = "DEMO TESTNET" if USE_DEMO_ACCOUNT else "REAL MAINNET"
-    print(f"        ┌ [API ENGINE v23.4 ({acc_mode}) - MODE: {mode_str}{forced_str}] {n}T WR:{wr:.0f}% W:{_stats['wins']} L:{_stats['losses']} PnL:{pnl:+.4f}U {failed_str}")
-    print(f"        └ TP:{_stats['tp_exit']} SL:{_stats['hard_sl']} LossTO:{_stats['time_limit_exit']} | VolVeto:{_stats['low_vol_veto']} | SameSideVeto:{_stats['same_side_veto']} | Weekly:{_weekly_pnl:+.4f}U/${ORDER_USDT:.2f}U")
+    print(f"        ┌ [API ENGINE v23.5 ({acc_mode}) - MODE: {mode_str}{forced_str}] {n}T WR:{wr:.0f}% W:{_stats['wins']} L:{_stats['losses']} PnL:{pnl:+.4f}U {failed_str}")
+    print(f"        └ TP:{_stats['tp_exit']} SL:{_stats['hard_sl']} LossTO:{_stats['time_limit_exit']} | VolVeto:{_stats['low_vol_veto']} | SameSideVeto:{_stats['same_side_veto']} | Weekly:{_weekly_pnl:+.4f}U/${weekly_target_usdt():.2f}U")
 
 def print_full():
     n = _stats["wins"] + _stats["losses"]
@@ -1400,7 +1418,7 @@ def print_full():
     print(f"    🔔 INSTITUTIONAL SCALPING DASHBOARD ({acc_mode} | MODE: {mode_str}{forced_str}){failed_str} [{now_wita}]")
     print(f"    🎯 {n}T WR:{wr:.0f}% W:{_stats['wins']} L:{_stats['losses']}")
     print(f"    💰 Margin:${ORDER_USDT:.2f} | TP:+{tp_u:.2f}U | SL:-{sl_u:.2f}U per trade | LossTimeLimit:{MAX_LOSS_HOLD_SECONDS/60:.0f}m")
-    print(f"    PnL Net:{pnl:+.5f}U | Weekly PnL:{_weekly_pnl:+.5f}U / Target:${ORDER_USDT:.2f}U | ATH PnL:{_stats['ath_pnl']:+.5f}U")
+    print(f"    PnL Net:{pnl:+.5f}U | Weekly PnL:{_weekly_pnl:+.5f}U / Target:${weekly_target_usdt():.2f}U | ATH PnL:{_stats['ath_pnl']:+.5f}U")
     print(f"    🏆 Best Win:{_stats['best']:+.5f}U | 💥 Worst Loss:{_stats['worst']:+.5f}U")
     print(f"    📈 Exit: TP:{_stats['tp_exit']} | SL:{_stats['hard_sl']} | LossTimeout:{_stats['time_limit_exit']} | VolVeto:{_stats['low_vol_veto']} | SameSideVeto:{_stats['same_side_veto']}")
 
@@ -1554,12 +1572,12 @@ def run_bot():
     acc_type_str = "BINANCE FUTURES DEMO (TESTNET)" if USE_DEMO_ACCOUNT else "BINANCE FUTURES REAL MAINNET"
     tp_u, sl_u = tp_sl_usdt()
     print("╔════════════════════════════════════════════════════════════════════╗")
-    print(f"║  💎 BOT SCALPING v23.4 — LIVE BINANCE API EXECUTION ENGINE         ║")
+    print(f"║  💎 BOT SCALPING v23.5 — LIVE BINANCE API EXECUTION ENGINE         ║")
     print(f"║  MODE AKUN: {acc_type_str:<51} ║")
     print("║  1. Mode Awal: NORMAL (Arah Bebas Sesuai Sinyal Indikator)         ║")
     print("║  2. Strict Filter: Volume Ratio >= 0.85 & ADX >= 20 (Anti-Sideway) ║")
     print("║  3. Inverted Lock Engine (SHORT loss -> LONG, LONG loss -> SHORT)  ║")
-    print(f"║  4. Target Mingguan = ${ORDER_USDT:.2f} (sama dengan margin) | Reset Senin WITA  ║")
+    print(f"║  4. Target Mingguan = ${weekly_target_usdt():.2f} (margin ${ORDER_USDT:.2f}) | Reset Senin WITA     ║")
     print(f"║  5. Margin=${ORDER_USDT:.2f} | TP=+${tp_u:.2f} | SL=-${sl_u:.2f} per trade               ║")
     print(f"║  6. Loss Time Limit: cut kalau minus terus {MAX_LOSS_HOLD_SECONDS/60:.0f} menit (reset jika profit) ║")
     print("╚════════════════════════════════════════════════════════════════════╝")
@@ -1607,7 +1625,7 @@ def run_bot():
         now_wita = datetime.now(tz=WITA_TZ).strftime("%H:%M:%S")
         guard_status = f" | Guard:[{_last_failed_execution_side}]" if _last_failed_execution_side else ""
         print(f"\n{'═'*68}")
-        print(f"  #{cycle} {now_wita} WITA | BTC_5M:{_macro['btc']} Mode:[{mode_str}{forced_str}]{guard_status} ActivePos:({len(live_positions)}/{MAX_POSITIONS}) PnL:{_stats['pnl']:+.4f}U | Weekly:{_weekly_pnl:+.4f}U/${ORDER_USDT:.2f}U")
+        print(f"  #{cycle} {now_wita} WITA | BTC_5M:{_macro['btc']} Mode:[{mode_str}{forced_str}]{guard_status} ActivePos:({len(live_positions)}/{MAX_POSITIONS}) PnL:{_stats['pnl']:+.4f}U | Weekly:{_weekly_pnl:+.4f}U/${weekly_target_usdt():.2f}U")
 
         wk_target = weekly_target_check()
         if wk_target[0]: print(f"  🎯 WEEKLY PAUSED: {wk_target[1]} — Menunggu Hari Senin untuk Reset OOT")
